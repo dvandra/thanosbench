@@ -172,9 +172,15 @@ func registerBlockPlan(m map[string]setupFunc, root *kingpin.CmdClause) {
 Example plan with generation:
 
 ./thanosbench block plan -p <profile> --labels 'cluster="one"' --max-time 2019-10-18T00:00:00Z | ./thanosbench block gen --output.dir ./genblocks --workers 20`)
-	profile := cmd.Flag("profile", "Name of the harcoded profile to use").Required().Short('p').Enum(blockgen.Profiles.Keys()...)
+	profile := cmd.Flag("profile", "Name of the harcoded profile to use").Short('p').Enum(blockgen.Profiles.Keys()...)
 	maxTime := model.TimeOrDuration(cmd.Flag("max-time", "If empty current time - 30m (usual consistency delay) is used.").Default("30m"))
 	extLset := cmd.Flag("labels", "External labels for block stream (repeated).").PlaceHolder("<name>=\"<value>\"").Strings()
+	configYaml := cmd.Flag("config", "Config YAML for more easily repeatable runs.").PlaceHolder("<configfile>").Strings()
+
+	if profile == nil && configYaml == nil {
+		fmt.Println("Either profile or config must be set.")
+		return
+	}
 	m["block plan"] = func(g *run.Group, _ log.Logger) error {
 		ctx, cancel := context.WithCancel(context.Background())
 		g.Add(func() error {
@@ -182,6 +188,14 @@ Example plan with generation:
 			if err != nil {
 				return err
 			}
+
+			// cyaml, err := parseFlagLabels(*configYaml)
+			// if err != nil {
+			// 	return err
+			// }
+
+			// TODO: import metrics from configYaml (demartial, decode, whatever)
+
 			planFn := blockgen.Profiles[*profile]
 
 			enc := yaml.NewEncoder(os.Stdout)
