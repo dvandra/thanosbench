@@ -1,0 +1,9 @@
+type: s3
+config:
+  bucket: <your-bucket>
+  endpoint: s3.amazonaws.com
+  access_key: <your-access-key>
+  secret_key: <your-secret-key>
+  region: us-west-2
+  signature_version2: false
+prefix: <your-subfolder>
