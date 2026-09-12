@@ -7,7 +7,7 @@ This guide provides step-by-step instructions for generating Thanos blocks metri
 - **OpenShift Cluster** with `multicluster-observability-operator` installed.
 - `oc` CLI tool installed and configured for logging into the cluster.
 - **S3 Bucket** to store the generated data, which will be used as the `thanos-object-storage` endpoint.
-- **ACM Right-Sizing Namespace Dashboard** defined in `thanos-metrics-analyzer` (Developer Preview).
+- **ACM Right-Sizing dashboards** for namespace, workload, and pod recommendation views.
 
 ## Steps
 
@@ -16,14 +16,10 @@ This guide provides step-by-step instructions for generating Thanos blocks metri
 1. Clone the `thanosbench` repository:
 
     ```bash
-    git clone https://github.com/Anxhela21/thanosbench/
+    git clone https://github.com/dvandra/thanosbench/
     ```
 
-    - Use the branch `anx/rs-data-gen`:
-
-    ```bash
-    git checkout anx/rs-data-gen
-    ```
+    - Use the `master` branch (default).
 
 2. Build `thanosbench`:
 
@@ -38,18 +34,37 @@ This guide provides step-by-step instructions for generating Thanos blocks metri
     ./run_thanosbench.sh
     ```
 
-    **Note:** The profile used for block generation is defined in `pkg/blockgen/profile.go`. By default, the profile `cc-1w-small-rs` is used, which generates one week of data. 
+    **Note:** Profiles are defined in `pkg/blockgen/profiles.go`. The default profile is `custom-continous-1-week-workload-pod`, which generates one week of cluster, namespace, workload, and pod right-sizing metrics.
 
+    Scale is controlled by environment variables (edit the defaults in the scripts, or override at run time):
 
-    You can adjust the following parameters directly in the `run_thanosbench.sh` script:
-    - Number of clusters
-    - Number of namespaces per cluster
-    - Maximum time duration
-    - `minGauge` and `maxGauge` values for simulating realistic metric data
-    - Profile selection
+    | Variable | Default | Meaning |
+    |---|---|---|
+    | `NUM_CLUSTERS` | `10` | Clusters to generate |
+    | `NUM_NAMESPACES` | `100` | Namespaces per cluster |
+    | `NUM_WORKLOADS` | `10` | Workloads per namespace |
+    | `NUM_PODS` | `3` | Pods per workload |
+    | `PROFILE` | `custom-continous-1-week-workload-pod` | Blockgen profile |
+    | `CLUSTER_STEP` | `2` | Clusters per parallel worker (`run_parallel.sh` only) |
 
+    Examples:
 
-    **Note**: For running in parallel, run `./run_parallel.sh` after adjusting the range settings as desired.
+    ```bash
+    # Default: 10 clusters × 100 namespaces × 10 workloads × 3 pods
+    ./run_thanosbench.sh
+
+    # Smaller smoke run
+    NUM_CLUSTERS=2 NUM_NAMESPACES=5 NUM_WORKLOADS=2 NUM_PODS=2 ./run_thanosbench.sh
+
+    # Parallel across 10 clusters
+    NUM_CLUSTERS=10 NUM_NAMESPACES=100 NUM_WORKLOADS=10 NUM_PODS=3 ./run_parallel.sh
+    ```
+
+    Workload series are labeled with `namespace`, `workload`, and `workload_type`. Pod series also include a `pod` label. To generate VM data instead:
+
+    ```bash
+    PROFILE=custom-continous-1-week-vm NUM_NAMES=100 ./run_parallel.sh
+    ```
 
 ### 2. Store Data Blocks in S3
 

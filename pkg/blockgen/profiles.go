@@ -218,7 +218,7 @@ var (
 			"acm_rs:namespace:cpu_recommendation", "acm_rs:namespace:memory_recommendation",
 			"acm_rs:cluster:cpu_request", "acm_rs:cluster:cpu_usage",
 			"acm_rs:cluster:memory_request", "acm_rs:cluster:memory_usage",
-			"acm_rs:cluster:cpu_recommendation", "acm_rs:cluster:memory_recommendation", 
+			"acm_rs:cluster:cpu_recommendation", "acm_rs:cluster:memory_recommendation",
 			"extra_metric_1",
 			"extra_metric_2", "extra_metric_3", "extra_metric_4", "extra_metric_5", "extra_metric_6",
 			"extra_metric_7", "extra_metric_8", "extra_metric_9", "extra_metric_10", "extra_metric_11",
@@ -260,6 +260,32 @@ var (
 			"extra_metric_187", "extra_metric_188", "extra_metric_189", "extra_metric_190", "extra_metric_191",
 			"extra_metric_192", "extra_metric_193", "extra_metric_194", "extra_metric_195", "extra_metric_196",
 			"extra_metric_197", "extra_metric_198", "extra_metric_199", "extra_metric_200"}),
+
+		"custom-continous-1-week-workload-pod": custom_continuous_workload_pod([]time.Duration{
+			// One week, from newest to oldest, in the same way Thanos compactor would do.
+			2 * time.Hour,
+			2 * time.Hour,
+			2 * time.Hour,
+			8 * time.Hour,
+			8 * time.Hour,
+			48 * time.Hour,
+			48 * time.Hour,
+			48 * time.Hour,
+			2 * time.Hour,
+		}, 1, []string{
+			"acm_rs:cluster:cpu_request", "acm_rs:cluster:cpu_usage",
+			"acm_rs:cluster:memory_request", "acm_rs:cluster:memory_usage",
+			"acm_rs:cluster:cpu_recommendation", "acm_rs:cluster:memory_recommendation",
+			"acm_rs:namespace:cpu_request", "acm_rs:namespace:cpu_usage",
+			"acm_rs:namespace:memory_request", "acm_rs:namespace:memory_usage",
+			"acm_rs:namespace:cpu_recommendation", "acm_rs:namespace:memory_recommendation",
+			"acm_rs:workload:cpu_request", "acm_rs:workload:cpu_usage",
+			"acm_rs:workload:memory_request", "acm_rs:workload:memory_usage",
+			"acm_rs:workload:cpu_recommendation", "acm_rs:workload:memory_recommendation",
+			"acm_rs:pod:cpu_request", "acm_rs:pod:cpu_usage",
+			"acm_rs:pod:memory_request", "acm_rs:pod:memory_usage",
+			"acm_rs:pod:cpu_recommendation", "acm_rs:pod:memory_recommendation",
+		}),
 	}
 )
 
@@ -480,6 +506,166 @@ func custom_continuous(ranges []time.Duration, apps int, metrics []string) PlanF
 						b.Series = append(b.Series, s)
 
 					}
+				}
+			}
+
+			if err := blockEncoder(b); err != nil {
+				return err
+			}
+			maxt = mint
+		}
+		return nil
+	}
+}
+
+func envInt(key string, defaultVal int) int {
+	s := os.Getenv(key)
+	if s == "" {
+		return defaultVal
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return defaultVal
+	}
+	return n
+}
+
+func envFloat(key string, defaultVal float64) float64 {
+	s := os.Getenv(key)
+	if s == "" {
+		return defaultVal
+	}
+	n, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return defaultVal
+	}
+	return n
+}
+
+var workloadTypes = []string{"deployment", "statefulset", "daemonset"}
+
+func workloadTypeFor(index int) string {
+	return workloadTypes[index%len(workloadTypes)]
+}
+
+// rsDimensionSets returns one label set per series for a right-sizing metric.
+// Cluster metrics are a single series (cluster is an external label).
+// Namespace metrics fan out by namespace.
+// Workload metrics fan out by namespace × workload.
+// Pod metrics fan out by namespace × workload × pod.
+func rsDimensionSets(metric string, numNamespaces, numWorkloads, numPods int) []labels.Labels {
+	base := labels.Label{Name: "__name__", Value: metric}
+	switch {
+	case strings.Contains(metric, ":pod:"):
+		sets := make([]labels.Labels, 0, numNamespaces*numWorkloads*numPods)
+		for ns := 0; ns < numNamespaces; ns++ {
+			namespace := fmt.Sprintf("Namespace %d", ns)
+			for w := 0; w < numWorkloads; w++ {
+				workload := fmt.Sprintf("Workload %d", w)
+				wType := workloadTypeFor(w)
+				for p := 0; p < numPods; p++ {
+					pod := fmt.Sprintf("workload-%d-%s-%d", w, wType, p)
+					sets = append(sets, labels.New(
+						base,
+						labels.Label{Name: "namespace", Value: namespace},
+						labels.Label{Name: "pod", Value: pod},
+						labels.Label{Name: "workload", Value: workload},
+						labels.Label{Name: "workload_type", Value: wType},
+					))
+				}
+			}
+		}
+		return sets
+	case strings.Contains(metric, ":workload:"):
+		sets := make([]labels.Labels, 0, numNamespaces*numWorkloads)
+		for ns := 0; ns < numNamespaces; ns++ {
+			namespace := fmt.Sprintf("Namespace %d", ns)
+			for w := 0; w < numWorkloads; w++ {
+				workload := fmt.Sprintf("Workload %d", w)
+				wType := workloadTypeFor(w)
+				sets = append(sets, labels.New(
+					base,
+					labels.Label{Name: "namespace", Value: namespace},
+					labels.Label{Name: "workload", Value: workload},
+					labels.Label{Name: "workload_type", Value: wType},
+				))
+			}
+		}
+		return sets
+	case strings.Contains(metric, ":namespace:"):
+		sets := make([]labels.Labels, 0, numNamespaces)
+		for ns := 0; ns < numNamespaces; ns++ {
+			sets = append(sets, labels.New(
+				base,
+				labels.Label{Name: "namespace", Value: fmt.Sprintf("Namespace %d", ns)},
+			))
+		}
+		return sets
+	default:
+		return []labels.Labels{labels.New(base)}
+	}
+}
+
+// custom_continuous_workload_pod generates cluster/namespace/workload/pod right-sizing
+// series. Cardinality is controlled by environment variables:
+//
+//	NUM_NAMESPACES (default 100)  — namespaces per cluster
+//	NUM_WORKLOADS  (default 10)   — workloads per namespace
+//	NUM_PODS       (default 3)    — pods per workload
+//	MIN_GAUGE / MAX_GAUGE         — gauge value range
+func custom_continuous_workload_pod(ranges []time.Duration, apps int, metrics []string) PlanFn {
+	return func(ctx context.Context, maxTime model.TimeOrDurationValue, extLset labels.Labels, blockEncoder func(BlockSpec) error) error {
+		minGauge := envFloat("MIN_GAUGE", 2.0)
+		maxGauge := envFloat("MAX_GAUGE", 8.0)
+		numNamespaces := envInt("NUM_NAMESPACES", 100)
+		numWorkloads := envInt("NUM_WORKLOADS", 10)
+		numPods := envInt("NUM_PODS", 3)
+		randomJitter := rand.Intn(10) + 1
+
+		maxt := rangeForTimestamp(maxTime.PrometheusTimestamp(), durToMilis(2*time.Hour))
+
+		common := SeriesSpec{
+			Targets: apps,
+			Type:    Gauge,
+			Characteristics: seriesgen.Characteristics{
+				Max:            maxGauge,
+				Min:            minGauge,
+				Jitter:         float64(randomJitter),
+				ScrapeInterval: 15 * time.Minute,
+				ChangeInterval: 10 * time.Minute,
+			},
+		}
+
+		for _, r := range ranges {
+			mint := maxt - durToMilis(r) + 1
+
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+
+			b := BlockSpec{
+				Meta: metadata.Meta{
+					BlockMeta: tsdb.BlockMeta{
+						MaxTime:    maxt,
+						MinTime:    mint,
+						Compaction: tsdb.BlockMetaCompaction{Level: 1},
+						Version:    1,
+					},
+					Thanos: metadata.Thanos{
+						Labels:     extLset.Map(),
+						Downsample: metadata.ThanosDownsample{Resolution: 0},
+						Source:     "blockgen",
+					},
+				},
+			}
+
+			for _, metric := range metrics {
+				for _, lset := range rsDimensionSets(metric, numNamespaces, numWorkloads, numPods) {
+					s := common
+					s.Labels = lset
+					s.MinTime = mint
+					s.MaxTime = maxt
+					b.Series = append(b.Series, s)
 				}
 			}
 
