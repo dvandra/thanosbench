@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand" // Import the rand package
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -25,6 +26,135 @@ func (p ProfileMap) Keys() (keys []string) {
 		keys = append(keys, k)
 	}
 	return keys
+}
+
+// maxSeriesPerBlock caps the number of series a custom profile is allowed to plan
+// for a single block. The block writer accumulates a whole block in memory before
+// flushing, so an over-large NUM_* combination OOMs the process; we fail fast with
+// a clear message on stderr instead. The value leaves generous headroom over the
+// documented "50 namespaces x 200 names" ceiling of the existing profiles (~2.25M).
+const maxSeriesPerBlock = 5_000_000
+
+// cardScope is the aggregation scope of a metric emitted by custom_continuous. It
+// determines which breakdown labels the series carries and therefore its
+// cardinality, so cluster/namespace roll-ups are not inflated with dimensions
+// they should not have.
+type cardScope int
+
+const (
+	// scopeFlat emits one series per namespace x name. Used for the VM namespace
+	// level (which legitimately carries a per-VM `name`), the kubevirt metric and
+	// the extra_metric_* filler.
+	scopeFlat cardScope = iota
+	// scopeCluster emits a single series; the cluster/profile identity comes from
+	// the block (external) labels.
+	scopeCluster
+	// scopeNamespace emits one series per namespace, carrying only `namespace`.
+	scopeNamespace
+)
+
+// scopeFor classifies a metric name into its aggregation scope. Cluster-level
+// metrics (acm_rs:cluster:* and acm_rs_vm:cluster:*) collapse to a single series;
+// non-VM namespace metrics carry only `namespace`; everything else keeps the flat
+// namespace x name shape.
+func scopeFor(metric string) cardScope {
+	switch {
+	case strings.Contains(metric, ":cluster:"):
+		return scopeCluster
+	case strings.HasPrefix(metric, "acm_rs:namespace:"):
+		return scopeNamespace
+	default:
+		return scopeFlat
+	}
+}
+
+// rsProfiles are the recording-rule "profile" variants the ACM right-sizing
+// dashboards expose in their $profile dropdown (label_values(...,profile)). In
+// real data `profile` is a per-series label emitted by the recording rules, so
+// each acm_rs*/acm_rs_vm* metric is generated once per profile with a `profile`
+// breakdown label rather than relying on a single block-level --labels value.
+var rsProfiles = []string{"Max OverAll", "P95", "P99"}
+
+// recommendationRatio is the headroom the ACM right-sizing rules apply over
+// observed usage (recommendation = usage * 110/100). A *_recommendation series
+// is seeded from its *_usage sibling and scaled by this factor so the two track
+// together instead of being independent random draws (see SeriesSpec.SeedName /
+// ValueScale).
+const recommendationRatio = 1.10
+
+// defaultMemMin / defaultMemMax are the byte-scale gauge bounds used for memory_*
+// measures when MEM_MIN_GAUGE / MEM_MAX_GAUGE are unset. ACM memory right-sizing
+// metrics are reported in bytes, so a cores-scale range (MIN_GAUGE/MAX_GAUGE,
+// single digits) would render them as a handful of bytes; these defaults place
+// them at realistic MB/GB magnitudes (512 MiB to 32 GiB).
+const (
+	defaultMemMin = 512 * 1024 * 1024       // 512 MiB
+	defaultMemMax = 32 * 1024 * 1024 * 1024 // 32 GiB
+)
+
+// memJitterFraction sizes the per-sample jitter of memory gauges as a fraction of
+// their (max-min) byte range, so byte-scale series still show realistic movement
+// (a fixed cores-scale jitter of a few units is invisible at gigabyte levels).
+const memJitterFraction = 0.05
+
+// isMemoryMetric reports whether a fully-qualified metric name is a memory gauge
+// (…:memory_*), which is measured in bytes and therefore drawn from the
+// byte-scale range rather than the cores-scale MIN_GAUGE/MAX_GAUGE.
+func isMemoryMetric(metric string) bool {
+	return strings.Contains(metric, "memory")
+}
+
+// isRightSizingMetric reports whether a metric belongs to the ACM right-sizing
+// recording-rule families (acm_rs:* / acm_rs_vm:*) that carry a per-series
+// `profile` label. kubevirt_* and extra_metric_* filler do not.
+func isRightSizingMetric(metric string) bool {
+	return strings.HasPrefix(metric, "acm_rs:") || strings.HasPrefix(metric, "acm_rs_vm:")
+}
+
+// usageSibling maps a *_recommendation metric to its *_usage counterpart (same
+// family and aggregation level) so the recommendation series can share the
+// usage series' value stream. It returns false for non-recommendation metrics.
+func usageSibling(metric string) (string, bool) {
+	const suffix = "_recommendation"
+	if strings.HasSuffix(metric, suffix) {
+		return strings.TrimSuffix(metric, suffix) + "_usage", true
+	}
+	return "", false
+}
+
+// measureSpec returns a copy of base configured for the given fully-qualified
+// metric name:
+//   - memory_* measures are rescaled to the byte-scale range [memMin, memMax]
+//     (with proportional jitter) so they land at MB/GB magnitudes instead of a
+//     handful of bytes;
+//   - a *_recommendation metric is wired to derive from its *_usage sibling
+//     (SeedName) scaled by recommendationRatio (ValueScale);
+//   - every other metric keeps base unchanged.
+//
+// Because a memory recommendation and its usage sibling both receive the same
+// (memory) characteristics and share an RNG seed, recommendation = usage * ratio
+// still holds exactly.
+func measureSpec(base SeriesSpec, metric string, memMin, memMax float64) SeriesSpec {
+	if isMemoryMetric(metric) {
+		base.Characteristics.Min = memMin
+		base.Characteristics.Max = memMax
+		base.Characteristics.Jitter = (memMax - memMin) * memJitterFraction
+	}
+	if sib, ok := usageSibling(metric); ok {
+		base.SeedName = sib
+		base.ValueScale = recommendationRatio
+	}
+	return base
+}
+
+// profilesFor returns the per-series profile values a metric should be emitted
+// under: the three right-sizing profiles for acm_rs* families, or a single
+// empty value (no profile label) for everything else.
+func profilesFor(metric string) []string {
+	if isRightSizingMetric(metric) {
+		return rsProfiles
+	}
+	return []string{""}
 }
 
 var (
@@ -138,6 +268,10 @@ var (
 			// 10,000 series per block.
 		}, 10000, 1),
 
+		// custom-continous-1-week emits the ACM right-sizing namespace/cluster
+		// metrics (non-VM) plus NUM_EXTRA_METRICS synthetic filler series. The
+		// filler is generated by custom_continuous itself (default 200) so it no
+		// longer has to be inlined here.
 		"custom-continous-1-week": custom_continuous([]time.Duration{
 			// One week, from newest to oldest, in the same way Thanos compactor would do.
 			2 * time.Hour,
@@ -149,53 +283,23 @@ var (
 			48 * time.Hour,
 			48 * time.Hour,
 			2 * time.Hour,
-		}, 1, []string{"kubevirt_vm_running_status_last", "acm_rs:namespace:cpu_request", "acm_rs:namespace:cpu_usage",
+		}, 1, []string{
+			"kubevirt_vm_running_status_last",
+			// namespace level (request_hard is the ResourceQuota ceiling the
+			// namespaces dashboard's "hard limit" panels query)
+			"acm_rs:namespace:cpu_request", "acm_rs:namespace:cpu_usage",
 			"acm_rs:namespace:memory_request", "acm_rs:namespace:memory_usage",
 			"acm_rs:namespace:cpu_recommendation", "acm_rs:namespace:memory_recommendation",
+			"acm_rs:namespace:cpu_request_hard", "acm_rs:namespace:memory_request_hard",
+			// cluster level
 			"acm_rs:cluster:cpu_request", "acm_rs:cluster:cpu_usage",
 			"acm_rs:cluster:memory_request", "acm_rs:cluster:memory_usage",
-			"acm_rs:cluster:cpu_recommendation", "acm_rs:cluster:memory_recommendation", "extra_metric_1",
-			"extra_metric_2", "extra_metric_3", "extra_metric_4", "extra_metric_5", "extra_metric_6",
-			"extra_metric_7", "extra_metric_8", "extra_metric_9", "extra_metric_10", "extra_metric_11",
-			"extra_metric_12", "extra_metric_13", "extra_metric_14", "extra_metric_15", "extra_metric_16",
-			"extra_metric_17", "extra_metric_18", "extra_metric_19", "extra_metric_20", "extra_metric_21",
-			"extra_metric_22", "extra_metric_23", "extra_metric_24", "extra_metric_25", "extra_metric_26",
-			"extra_metric_27", "extra_metric_28", "extra_metric_29", "extra_metric_30", "extra_metric_31",
-			"extra_metric_32", "extra_metric_33", "extra_metric_34", "extra_metric_35", "extra_metric_36",
-			"extra_metric_37", "extra_metric_38", "extra_metric_39", "extra_metric_40", "extra_metric_41",
-			"extra_metric_42", "extra_metric_43", "extra_metric_44", "extra_metric_45", "extra_metric_46",
-			"extra_metric_47", "extra_metric_48", "extra_metric_49", "extra_metric_50", "extra_metric_51",
-			"extra_metric_52", "extra_metric_53", "extra_metric_54", "extra_metric_55", "extra_metric_56",
-			"extra_metric_57", "extra_metric_58", "extra_metric_59", "extra_metric_60", "extra_metric_61",
-			"extra_metric_62", "extra_metric_63", "extra_metric_64", "extra_metric_65", "extra_metric_66",
-			"extra_metric_67", "extra_metric_68", "extra_metric_69", "extra_metric_70", "extra_metric_71",
-			"extra_metric_72", "extra_metric_73", "extra_metric_74", "extra_metric_75", "extra_metric_76",
-			"extra_metric_77", "extra_metric_78", "extra_metric_79", "extra_metric_80", "extra_metric_81",
-			"extra_metric_82", "extra_metric_83", "extra_metric_84", "extra_metric_85", "extra_metric_86",
-			"extra_metric_87", "extra_metric_88", "extra_metric_89", "extra_metric_90", "extra_metric_91",
-			"extra_metric_92", "extra_metric_93", "extra_metric_94", "extra_metric_95", "extra_metric_96",
-			"extra_metric_97", "extra_metric_98", "extra_metric_99", "extra_metric_100", "extra_metric_101",
-			"extra_metric_102", "extra_metric_103", "extra_metric_104", "extra_metric_105", "extra_metric_106",
-			"extra_metric_107", "extra_metric_108", "extra_metric_109", "extra_metric_110", "extra_metric_111",
-			"extra_metric_112", "extra_metric_113", "extra_metric_114", "extra_metric_115", "extra_metric_116",
-			"extra_metric_117", "extra_metric_118", "extra_metric_119", "extra_metric_120", "extra_metric_121",
-			"extra_metric_122", "extra_metric_123", "extra_metric_124", "extra_metric_125", "extra_metric_126",
-			"extra_metric_127", "extra_metric_128", "extra_metric_129", "extra_metric_130", "extra_metric_131",
-			"extra_metric_132", "extra_metric_133", "extra_metric_134", "extra_metric_135", "extra_metric_136",
-			"extra_metric_137", "extra_metric_138", "extra_metric_139", "extra_metric_140", "extra_metric_141",
-			"extra_metric_142", "extra_metric_143", "extra_metric_144", "extra_metric_145", "extra_metric_146",
-			"extra_metric_147", "extra_metric_148", "extra_metric_149", "extra_metric_150", "extra_metric_151",
-			"extra_metric_152", "extra_metric_153", "extra_metric_154", "extra_metric_155", "extra_metric_156",
-			"extra_metric_157", "extra_metric_158", "extra_metric_159", "extra_metric_160", "extra_metric_161",
-			"extra_metric_162", "extra_metric_163", "extra_metric_164", "extra_metric_165", "extra_metric_166",
-			"extra_metric_167", "extra_metric_168", "extra_metric_169", "extra_metric_170", "extra_metric_171",
-			"extra_metric_172", "extra_metric_173", "extra_metric_174", "extra_metric_175", "extra_metric_176",
-			"extra_metric_177", "extra_metric_178", "extra_metric_179", "extra_metric_180", "extra_metric_181",
-			"extra_metric_182", "extra_metric_183", "extra_metric_184", "extra_metric_185", "extra_metric_186",
-			"extra_metric_187", "extra_metric_188", "extra_metric_189", "extra_metric_190", "extra_metric_191",
-			"extra_metric_192", "extra_metric_193", "extra_metric_194", "extra_metric_195", "extra_metric_196",
-			"extra_metric_197", "extra_metric_198", "extra_metric_199", "extra_metric_200"}),
-		
+			"acm_rs:cluster:cpu_recommendation", "acm_rs:cluster:memory_recommendation",
+		}),
+
+		// custom-continous-1-week-vm additionally emits the VM (acm_rs_vm:*)
+		// namespace/cluster metrics. Filler is generated by custom_continuous
+		// (NUM_EXTRA_METRICS, default 200).
 		"custom-continous-1-week-vm": custom_continuous([]time.Duration{
 			// One week, from newest to oldest, in the same way Thanos compactor would do.
 			2 * time.Hour,
@@ -207,60 +311,30 @@ var (
 			48 * time.Hour,
 			48 * time.Hour,
 			2 * time.Hour,
-		}, 1, []string{"kubevirt_vm_running_status_last_transition_timestamp_seconds", "acm_rs_vm:namespace:cpu_request", "acm_rs_vm:namespace:cpu_usage",
+		}, 1, []string{
+			"kubevirt_vm_running_status_last_transition_timestamp_seconds",
+			// VM namespace level
+			"acm_rs_vm:namespace:cpu_request", "acm_rs_vm:namespace:cpu_usage",
 			"acm_rs_vm:namespace:memory_request", "acm_rs_vm:namespace:memory_usage",
 			"acm_rs_vm:namespace:cpu_recommendation", "acm_rs_vm:namespace:memory_recommendation",
+			// VM cluster level
 			"acm_rs_vm:cluster:cpu_request", "acm_rs_vm:cluster:cpu_usage",
 			"acm_rs_vm:cluster:memory_request", "acm_rs_vm:cluster:memory_usage",
-			"acm_rs_vm:cluster:cpu_recommendation", "acm_rs_vm:cluster:memory_recommendation", 
+			"acm_rs_vm:cluster:cpu_recommendation", "acm_rs_vm:cluster:memory_recommendation",
+			// namespace level (request_hard is the ResourceQuota ceiling the
+			// namespaces dashboard's "hard limit" panels query)
 			"acm_rs:namespace:cpu_request", "acm_rs:namespace:cpu_usage",
 			"acm_rs:namespace:memory_request", "acm_rs:namespace:memory_usage",
 			"acm_rs:namespace:cpu_recommendation", "acm_rs:namespace:memory_recommendation",
+			"acm_rs:namespace:cpu_request_hard", "acm_rs:namespace:memory_request_hard",
+			// cluster level
 			"acm_rs:cluster:cpu_request", "acm_rs:cluster:cpu_usage",
 			"acm_rs:cluster:memory_request", "acm_rs:cluster:memory_usage",
 			"acm_rs:cluster:cpu_recommendation", "acm_rs:cluster:memory_recommendation",
-			"extra_metric_1",
-			"extra_metric_2", "extra_metric_3", "extra_metric_4", "extra_metric_5", "extra_metric_6",
-			"extra_metric_7", "extra_metric_8", "extra_metric_9", "extra_metric_10", "extra_metric_11",
-			"extra_metric_12", "extra_metric_13", "extra_metric_14", "extra_metric_15", "extra_metric_16",
-			"extra_metric_17", "extra_metric_18", "extra_metric_19", "extra_metric_20", "extra_metric_21",
-			"extra_metric_22", "extra_metric_23", "extra_metric_24", "extra_metric_25", "extra_metric_26",
-			"extra_metric_27", "extra_metric_28", "extra_metric_29", "extra_metric_30", "extra_metric_31",
-			"extra_metric_32", "extra_metric_33", "extra_metric_34", "extra_metric_35", "extra_metric_36",
-			"extra_metric_37", "extra_metric_38", "extra_metric_39", "extra_metric_40", "extra_metric_41",
-			"extra_metric_42", "extra_metric_43", "extra_metric_44", "extra_metric_45", "extra_metric_46",
-			"extra_metric_47", "extra_metric_48", "extra_metric_49", "extra_metric_50", "extra_metric_51",
-			"extra_metric_52", "extra_metric_53", "extra_metric_54", "extra_metric_55", "extra_metric_56",
-			"extra_metric_57", "extra_metric_58", "extra_metric_59", "extra_metric_60", "extra_metric_61",
-			"extra_metric_62", "extra_metric_63", "extra_metric_64", "extra_metric_65", "extra_metric_66",
-			"extra_metric_67", "extra_metric_68", "extra_metric_69", "extra_metric_70", "extra_metric_71",
-			"extra_metric_72", "extra_metric_73", "extra_metric_74", "extra_metric_75", "extra_metric_76",
-			"extra_metric_77", "extra_metric_78", "extra_metric_79", "extra_metric_80", "extra_metric_81",
-			"extra_metric_82", "extra_metric_83", "extra_metric_84", "extra_metric_85", "extra_metric_86",
-			"extra_metric_87", "extra_metric_88", "extra_metric_89", "extra_metric_90", "extra_metric_91",
-			"extra_metric_92", "extra_metric_93", "extra_metric_94", "extra_metric_95", "extra_metric_96",
-			"extra_metric_97", "extra_metric_98", "extra_metric_99", "extra_metric_100", "extra_metric_101",
-			"extra_metric_102", "extra_metric_103", "extra_metric_104", "extra_metric_105", "extra_metric_106",
-			"extra_metric_107", "extra_metric_108", "extra_metric_109", "extra_metric_110", "extra_metric_111",
-			"extra_metric_112", "extra_metric_113", "extra_metric_114", "extra_metric_115", "extra_metric_116",
-			"extra_metric_117", "extra_metric_118", "extra_metric_119", "extra_metric_120", "extra_metric_121",
-			"extra_metric_122", "extra_metric_123", "extra_metric_124", "extra_metric_125", "extra_metric_126",
-			"extra_metric_127", "extra_metric_128", "extra_metric_129", "extra_metric_130", "extra_metric_131",
-			"extra_metric_132", "extra_metric_133", "extra_metric_134", "extra_metric_135", "extra_metric_136",
-			"extra_metric_137", "extra_metric_138", "extra_metric_139", "extra_metric_140", "extra_metric_141",
-			"extra_metric_142", "extra_metric_143", "extra_metric_144", "extra_metric_145", "extra_metric_146",
-			"extra_metric_147", "extra_metric_148", "extra_metric_149", "extra_metric_150", "extra_metric_151",
-			"extra_metric_152", "extra_metric_153", "extra_metric_154", "extra_metric_155", "extra_metric_156",
-			"extra_metric_157", "extra_metric_158", "extra_metric_159", "extra_metric_160", "extra_metric_161",
-			"extra_metric_162", "extra_metric_163", "extra_metric_164", "extra_metric_165", "extra_metric_166",
-			"extra_metric_167", "extra_metric_168", "extra_metric_169", "extra_metric_170", "extra_metric_171",
-			"extra_metric_172", "extra_metric_173", "extra_metric_174", "extra_metric_175", "extra_metric_176",
-			"extra_metric_177", "extra_metric_178", "extra_metric_179", "extra_metric_180", "extra_metric_181",
-			"extra_metric_182", "extra_metric_183", "extra_metric_184", "extra_metric_185", "extra_metric_186",
-			"extra_metric_187", "extra_metric_188", "extra_metric_189", "extra_metric_190", "extra_metric_191",
-			"extra_metric_192", "extra_metric_193", "extra_metric_194", "extra_metric_195", "extra_metric_196",
-			"extra_metric_197", "extra_metric_198", "extra_metric_199", "extra_metric_200"}),
+		}),
 
+		// Retain the workload/pod profile introduced on workload-pos-rs for
+		// compatibility with its scripts and callers.
 		"custom-continous-1-week-workload-pod": custom_continuous_workload_pod([]time.Duration{
 			// One week, from newest to oldest, in the same way Thanos compactor would do.
 			2 * time.Hour,
@@ -286,6 +360,37 @@ var (
 			"acm_rs:pod:memory_request", "acm_rs:pod:memory_usage",
 			"acm_rs:pod:cpu_recommendation", "acm_rs:pod:memory_recommendation",
 		}),
+
+		// custom-continous-1-week-full adds two aggregation levels (workload and
+		// pod) on top of the namespace and cluster levels, using the hierarchical
+		// label model the acm_rs recording rules / dashboards expect.
+		"custom-continous-1-week-full": rightSizingLeveled([]time.Duration{
+			2 * time.Hour,
+			2 * time.Hour,
+			2 * time.Hour,
+			8 * time.Hour,
+			8 * time.Hour,
+			48 * time.Hour,
+			48 * time.Hour,
+			48 * time.Hour,
+			2 * time.Hour,
+		}),
+
+		// custom-continous-3-day-full is the leveled right-sizing profile
+		// (rightSizingLeveled) over a 3-day (72h) window instead of a week, laid
+		// out newest-to-oldest the way the Thanos compactor would. Same label model
+		// and cardinality knobs as custom-continous-1-week-full.
+		"custom-continous-3-day-full": rightSizingLeveled([]time.Duration{
+			// 72h total = 3 days.
+			2 * time.Hour,
+			2 * time.Hour,
+			2 * time.Hour,
+			8 * time.Hour,
+			8 * time.Hour,
+			24 * time.Hour,
+			24 * time.Hour,
+			2 * time.Hour,
+		}),
 	}
 )
 
@@ -303,6 +408,41 @@ var (
 // 		return custom_continuous(ranges, apps, customMetrics)
 // 	}
 // }
+
+// getEnvInt returns the integer value of environment variable key. When the
+// variable is unset or empty the provided default is returned. A value that is
+// present but not a valid non-negative integer is a fatal configuration error:
+// the block plan is written to stdout, so silently substituting a wrong
+// cardinality would corrupt the generated data set. Fail loudly instead.
+func getEnvInt(key string, def int) (int, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s=%q: must be an integer: %w", key, v, err)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("invalid %s=%d: must be >= 0", key, n)
+	}
+	return n, nil
+}
+
+// getEnvFloat mirrors getEnvInt for float-valued environment variables (e.g.
+// MIN_GAUGE / MAX_GAUGE). Unset/empty yields the default; a non-empty but
+// unparseable value is a fatal error rather than a silent fallback.
+func getEnvFloat(key string, def float64) (float64, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s=%q: must be a number: %w", key, v, err)
+	}
+	return f, nil
+}
 
 func realisticK8s(ranges []time.Duration, rolloutInterval time.Duration, apps int, metricsPerApp int) PlanFn {
 	return func(ctx context.Context, maxTime model.TimeOrDurationValue, extLset labels.Labels, blockEncoder func(BlockSpec) error) error {
@@ -391,35 +531,74 @@ func realisticK8s(ranges []time.Duration, rolloutInterval time.Duration, apps in
 func custom_continuous(ranges []time.Duration, apps int, metrics []string) PlanFn {
 	return func(ctx context.Context, maxTime model.TimeOrDurationValue, extLset labels.Labels, blockEncoder func(BlockSpec) error) error {
 
-		// minGauge and maxGauge from environment variables
-		minGauge, err := strconv.ParseFloat(os.Getenv("MIN_GAUGE"), 64)
+		// Gauge value range and cardinality from the environment. Unset/empty
+		// falls back to the default; a present-but-invalid value fails fast.
+		minGauge, err := getEnvFloat("MIN_GAUGE", 2.0)
 		if err != nil {
-			minGauge = 2.0
+			return err
 		}
-
-		maxGauge, err := strconv.ParseFloat(os.Getenv("MAX_GAUGE"), 64)
+		maxGauge, err := getEnvFloat("MAX_GAUGE", 8.0)
 		if err != nil {
-			maxGauge = 8.0
+			return err
 		}
-
-		numNamespacesStr := os.Getenv("NUM_NAMESPACES")
-		if numNamespacesStr == "" {
-			numNamespacesStr = "50"
-		}
-
-		numNamespaces, err := strconv.Atoi(numNamespacesStr)
+		// Memory measures are byte-scale (MB/GB), so they use their own range
+		// rather than the cores-scale MIN_GAUGE/MAX_GAUGE.
+		memMin, err := getEnvFloat("MEM_MIN_GAUGE", defaultMemMin)
 		if err != nil {
-			numNamespaces = 0
+			return err
 		}
-
-		numNamesStr := os.Getenv("NUM_NAMES")
-		if numNamesStr == "" {
-			numNamesStr = "200"
-		}
-
-		numNames, err := strconv.Atoi(numNamesStr)
+		memMax, err := getEnvFloat("MEM_MAX_GAUGE", defaultMemMax)
 		if err != nil {
-			numNames = 0
+			return err
+		}
+		numNamespaces, err := getEnvInt("NUM_NAMESPACES", 50)
+		if err != nil {
+			return err
+		}
+		numNames, err := getEnvInt("NUM_NAMES", 200)
+		if err != nil {
+			return err
+		}
+		// NUM_EXTRA_METRICS controls the "extra_metric_<i>" filler load that used
+		// to be inlined per profile. Default 200 preserves the previous output.
+		numExtra, err := getEnvInt("NUM_EXTRA_METRICS", 200)
+		if err != nil {
+			return err
+		}
+
+		// Full metric list: caller-provided core metrics followed by the synthetic
+		// filler series (previously duplicated across every profile definition).
+		allMetrics := make([]string, 0, len(metrics)+numExtra)
+		allMetrics = append(allMetrics, metrics...)
+		for i := 1; i <= numExtra; i++ {
+			allMetrics = append(allMetrics, fmt.Sprintf("extra_metric_%d", i))
+		}
+
+		// Each metric is emitted according to its aggregation scope (see scopeFor):
+		// cluster-level metrics collapse to a single series, non-VM namespace
+		// metrics carry only `namespace`, and everything else keeps the flat
+		// namespace x name shape. acm_rs*/acm_rs_vm* metrics are additionally
+		// emitted once per right-sizing profile (Max OverAll/P95/P99), so their
+		// per-scope count is multiplied by len(rsProfiles). Project the per-block
+		// series count up front and refuse a run that would blow past the
+		// in-memory block cap.
+		projected := 0
+		for _, m := range allMetrics {
+			var base int
+			switch scopeFor(m) {
+			case scopeCluster:
+				base = 1
+			case scopeNamespace:
+				base = numNamespaces
+			default:
+				base = numNamespaces * numNames
+			}
+			projected += base * len(profilesFor(m))
+		}
+		fmt.Fprintf(os.Stderr, "custom_continuous: %d core + %d filler metric(s), %d namespaces x %d names x %d profiles -> %d series/block\n",
+			len(metrics), numExtra, numNamespaces, numNames, len(rsProfiles), projected)
+		if projected > maxSeriesPerBlock {
+			return fmt.Errorf("projected %d series/block exceeds cap %d: lower NUM_NAMESPACES/NUM_NAMES/NUM_EXTRA_METRICS", projected, maxSeriesPerBlock)
 		}
 
 		// Generate a random Jitter value between 1 and 10
@@ -477,35 +656,279 @@ func custom_continuous(ranges []time.Duration, apps int, metrics []string) PlanF
 				},
 			}
 
-			// Append specific metric names and namespaces
-			for _, metric := range metrics {
-				for i := 0; i < numNamespaces; i++ {
+			// Append each metric with the breakdown labels appropriate to its
+			// aggregation scope. acm_rs*/acm_rs_vm* metrics are emitted once per
+			// right-sizing profile (with a `profile` breakdown label); other
+			// metrics are emitted once with no profile label. *_recommendation
+			// metrics are seeded from their *_usage sibling and scaled so they
+			// track usage (see measureSpec).
+			for _, metric := range allMetrics {
+				spec := measureSpec(defaultMetricSpec, metric, memMin, memMax)
+				if strings.HasPrefix(metric, "extra_metric_") {
+					spec = extraMetricSpec
+				}
 
-					namespace := fmt.Sprintf("Namespace %d", i)
-
-					for j := 0; j < numNames; j++ {
-
-						name := fmt.Sprintf("Name %d", j)
-
-						// Check if the metric matches the "extra_metric_*" pattern
-						var s SeriesSpec
-						if strings.HasPrefix(metric, "extra_metric_") {
-							s = extraMetricSpec
-						} else {
-							s = defaultMetricSpec
-						}
-
-						s.Labels = labels.Labels{
-							{Name: "__name__", Value: metric},
-							{Name: "namespace", Value: namespace},
-							{Name: "name", Value: name},
-						}
-
-						s.MinTime = mint
-						s.MaxTime = maxt
-						b.Series = append(b.Series, s)
-
+				// emit appends one series: __name__ + breakdown + optional profile,
+				// sorted into canonical label order for a clean TSDB index.
+				emit := func(breakdown labels.Labels, profile string) {
+					s := spec
+					ls := make(labels.Labels, 0, len(breakdown)+2)
+					ls = append(ls, labels.Label{Name: "__name__", Value: metric})
+					ls = append(ls, breakdown...)
+					if profile != "" {
+						ls = append(ls, labels.Label{Name: "profile", Value: profile})
 					}
+					sort.Sort(ls)
+					s.Labels = ls
+					s.MinTime = mint
+					s.MaxTime = maxt
+					b.Series = append(b.Series, s)
+				}
+
+				for _, profile := range profilesFor(metric) {
+					switch scopeFor(metric) {
+					case scopeCluster:
+						// Single series; cluster identity comes from block labels.
+						emit(nil, profile)
+					case scopeNamespace:
+						for i := 0; i < numNamespaces; i++ {
+							emit(labels.Labels{
+								{Name: "namespace", Value: fmt.Sprintf("Namespace %d", i)},
+							}, profile)
+						}
+					default:
+						// Flat namespace x name (VM namespace, kubevirt, filler).
+						for i := 0; i < numNamespaces; i++ {
+							namespace := fmt.Sprintf("Namespace %d", i)
+							for j := 0; j < numNames; j++ {
+								emit(labels.Labels{
+									{Name: "namespace", Value: namespace},
+									{Name: "name", Value: fmt.Sprintf("Name %d", j)},
+								}, profile)
+							}
+						}
+					}
+				}
+			}
+
+			if err := blockEncoder(b); err != nil {
+				return err
+			}
+			maxt = mint
+		}
+		return nil
+	}
+}
+
+// rsWorkloadTypes are the workload kinds cycled across the synthetic workload and
+// pod series, matching the PascalCase values Kubernetes uses (and the
+// kubernetes-mixin `workload_type` convention).
+var rsWorkloadTypes = []string{"Deployment", "StatefulSet", "DaemonSet", "ReplicaSet"}
+
+// rsMeasures are the six right-sizing gauges emitted at every aggregation level.
+var rsMeasures = []string{
+	"cpu_request", "cpu_usage", "cpu_recommendation",
+	"memory_request", "memory_usage", "memory_recommendation",
+}
+
+// rightSizingLeveled generates ACM right-sizing gauges across four aggregation
+// levels — cluster, namespace, workload and pod — each carrying the per-level
+// breakdown labels the acm_rs recording rules / dashboards expect:
+//
+//	acm_rs:cluster:*    profile
+//	acm_rs:namespace:*  namespace, profile
+//	acm_rs:workload:*   namespace, workload, workload_type, profile
+//	acm_rs:pod:*        namespace, pod, workload, workload_type, profile  (pods nest under workloads)
+//
+// Every acm_rs metric is emitted once per right-sizing profile (Max OverAll/P95/
+// P99) with `profile` as a per-series label, matching how the recording rules
+// label the real data (so the dashboards' $profile dropdown is populated). The
+// namespace level additionally carries cpu/memory request_hard (the ResourceQuota
+// ceiling the namespaces dashboard queries). Each *_recommendation series is
+// seeded from its *_usage sibling and scaled by recommendationRatio so it tracks
+// usage instead of being an independent random draw.
+//
+// The cluster/aggregation identity is supplied as block (external) labels by the
+// caller via `block plan --labels`; profile is per-series and must NOT also be
+// passed via --labels.
+//
+// Per-measure series per block (before the profile multiplier):
+//
+//	cluster:   1
+//	namespace: NUM_NAMESPACES
+//	workload:  NUM_NAMESPACES * NUM_WORKLOADS
+//	pod:       NUM_NAMESPACES * NUM_WORKLOADS * NUM_PODS
+//
+// An optional NUM_EXTRA_METRICS filler load (off by default for this profile) can
+// be layered on for cardinality/load testing.
+func rightSizingLeveled(ranges []time.Duration) PlanFn {
+	return func(ctx context.Context, maxTime model.TimeOrDurationValue, extLset labels.Labels, blockEncoder func(BlockSpec) error) error {
+
+		minGauge, err := getEnvFloat("MIN_GAUGE", 2.0)
+		if err != nil {
+			return err
+		}
+		maxGauge, err := getEnvFloat("MAX_GAUGE", 8.0)
+		if err != nil {
+			return err
+		}
+		// Memory measures are byte-scale (MB/GB), so they use their own range
+		// rather than the cores-scale MIN_GAUGE/MAX_GAUGE.
+		memMin, err := getEnvFloat("MEM_MIN_GAUGE", defaultMemMin)
+		if err != nil {
+			return err
+		}
+		memMax, err := getEnvFloat("MEM_MAX_GAUGE", defaultMemMax)
+		if err != nil {
+			return err
+		}
+		numNamespaces, err := getEnvInt("NUM_NAMESPACES", 50)
+		if err != nil {
+			return err
+		}
+		numWorkloads, err := getEnvInt("NUM_WORKLOADS", 10)
+		if err != nil {
+			return err
+		}
+		numPods, err := getEnvInt("NUM_PODS", 20)
+		if err != nil {
+			return err
+		}
+		numExtra, err := getEnvInt("NUM_EXTRA_METRICS", 0)
+		if err != nil {
+			return err
+		}
+
+		// namespace level additionally carries the ResourceQuota "hard limit"
+		// gauges (cpu/memory request_hard) the namespaces dashboard queries.
+		rsNamespaceMeasures := append(append([]string{}, rsMeasures...),
+			"cpu_request_hard", "memory_request_hard")
+
+		perMeasure := 1 + numNamespaces + numNamespaces*numWorkloads + numNamespaces*numWorkloads*numPods
+		// request_hard exists at the namespace level only.
+		namespaceHard := numNamespaces * (len(rsNamespaceMeasures) - len(rsMeasures))
+		// acm_rs series are emitted once per profile; filler is not.
+		projected := len(rsProfiles)*(len(rsMeasures)*perMeasure+namespaceHard) + numExtra*numNamespaces
+		fmt.Fprintf(os.Stderr, "rightSizingLeveled: %d namespaces x %d workloads x %d pods x %d profiles (+%d filler) = %d series/block\n",
+			numNamespaces, numWorkloads, numPods, len(rsProfiles), numExtra, projected)
+		if projected > maxSeriesPerBlock {
+			return fmt.Errorf("projected %d series/block exceeds cap %d: lower NUM_NAMESPACES/NUM_WORKLOADS/NUM_PODS/NUM_EXTRA_METRICS", projected, maxSeriesPerBlock)
+		}
+
+		randomJitter := rand.Intn(10) + 1
+		maxt := rangeForTimestamp(maxTime.PrometheusTimestamp(), durToMilis(2*time.Hour))
+
+		coreSpec := SeriesSpec{
+			Targets: 1,
+			Type:    Gauge,
+			Characteristics: seriesgen.Characteristics{
+				Max:            maxGauge,
+				Min:            minGauge,
+				Jitter:         float64(randomJitter),
+				ScrapeInterval: 15 * time.Minute,
+				ChangeInterval: 10 * time.Minute,
+			},
+		}
+		extraSpec := coreSpec
+		extraSpec.Characteristics.ScrapeInterval = 5 * time.Minute
+
+		for _, r := range ranges {
+			mint := maxt - durToMilis(r) + 1
+
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+
+			b := BlockSpec{
+				Meta: metadata.Meta{
+					BlockMeta: tsdb.BlockMeta{
+						MaxTime:    maxt,
+						MinTime:    mint,
+						Compaction: tsdb.BlockMetaCompaction{Level: 1},
+						Version:    1,
+					},
+					Thanos: metadata.Thanos{
+						Labels:     extLset.Map(),
+						Downsample: metadata.ThanosDownsample{Resolution: 0},
+						Source:     "blockgen",
+					},
+				},
+			}
+
+			// add appends one series with __name__=name plus the given breakdown
+			// labels; the whole set is sorted so the TSDB index stays canonical.
+			// spec carries any recommendation seeding/scaling (see measureSpec).
+			add := func(name string, breakdown labels.Labels, spec SeriesSpec) {
+				ls := make(labels.Labels, 0, len(breakdown)+1)
+				ls = append(ls, labels.Label{Name: "__name__", Value: name})
+				ls = append(ls, breakdown...)
+				sort.Sort(ls)
+				spec.Labels = ls
+				spec.MinTime = mint
+				spec.MaxTime = maxt
+				b.Series = append(b.Series, spec)
+			}
+			// addRS emits an acm_rs measure at a level under one profile, wiring the
+			// recommendation-from-usage derivation from the fully-qualified name.
+			addRS := func(name string, breakdown labels.Labels, profile string) {
+				add(name, append(breakdown, labels.Label{Name: "profile", Value: profile}), measureSpec(coreSpec, name, memMin, memMax))
+			}
+
+			for _, profile := range rsProfiles {
+				for _, m := range rsMeasures {
+					// cluster level: one series per profile; cluster identity comes
+					// from the block labels.
+					addRS("acm_rs:cluster:"+m, nil, profile)
+				}
+
+				for ni := 0; ni < numNamespaces; ni++ {
+					ns := fmt.Sprintf("namespace-%d", ni)
+
+					// namespace level (core measures + request_hard).
+					for _, m := range rsNamespaceMeasures {
+						addRS("acm_rs:namespace:"+m, labels.Labels{
+							{Name: "namespace", Value: ns},
+						}, profile)
+					}
+
+					for wi := 0; wi < numWorkloads; wi++ {
+						wl := fmt.Sprintf("workload-%d", wi)
+						wt := rsWorkloadTypes[wi%len(rsWorkloadTypes)]
+
+						for _, m := range rsMeasures {
+							// workload level
+							addRS("acm_rs:workload:"+m, labels.Labels{
+								{Name: "namespace", Value: ns},
+								{Name: "workload", Value: wl},
+								{Name: "workload_type", Value: wt},
+							}, profile)
+						}
+
+						for pi := 0; pi < numPods; pi++ {
+							pod := fmt.Sprintf("%s-%d", wl, pi)
+
+							for _, m := range rsMeasures {
+								// pod level (nested under its workload)
+								addRS("acm_rs:pod:"+m, labels.Labels{
+									{Name: "namespace", Value: ns},
+									{Name: "pod", Value: pod},
+									{Name: "workload", Value: wl},
+									{Name: "workload_type", Value: wt},
+								}, profile)
+							}
+						}
+					}
+				}
+			}
+
+			// Optional filler load (NUM_EXTRA_METRICS), one series per namespace.
+			// Filler is not right-sizing data, so it carries no profile label.
+			for e := 1; e <= numExtra; e++ {
+				name := fmt.Sprintf("extra_metric_%d", e)
+				for ni := 0; ni < numNamespaces; ni++ {
+					add(name, labels.Labels{
+						{Name: "namespace", Value: fmt.Sprintf("namespace-%d", ni)},
+					}, extraSpec)
 				}
 			}
 

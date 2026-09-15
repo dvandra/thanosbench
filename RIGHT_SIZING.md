@@ -66,6 +66,84 @@ This guide provides step-by-step instructions for generating Thanos blocks metri
     PROFILE=custom-continous-1-week-vm NUM_NAMES=100 ./run_parallel.sh
     ```
 
+#### Available profiles
+
+The profiles are defined in `pkg/blockgen/profiles.go`:
+
+| Profile | Aggregation levels | Per-series breakdown labels |
+| --- | --- | --- |
+| `custom-continous-1-week` | namespace, cluster (`acm_rs:*`) | level-aware (see below) |
+| `custom-continous-1-week-vm` | namespace, cluster for both `acm_rs:*` and `acm_rs_vm:*` | level-aware (see below) |
+| `custom-continous-1-week-workload-pod` | cluster, namespace, workload, pod (`acm_rs:*`) | upstream-compatible hierarchical profile |
+| `custom-continous-1-week-full` | cluster, namespace, **workload**, **pod** (`acm_rs:*`) | hierarchical (see below) |
+| `custom-continous-3-day-full` | cluster, namespace, **workload**, **pod** (`acm_rs:*`) | three-day hierarchical profile |
+
+Each `acm_rs*`/`acm_rs_vm*` metric is emitted once per right-sizing **profile**
+(`Max OverAll`, `P95`, `P99`) with `profile` as a per-series label — matching how
+the recording rules label real data, so the dashboards' `$profile` dropdown is
+populated. Because `profile` is now per-series, it must **not** be passed via
+`--labels` (only `cluster`/`aggregation` are block-level external labels).
+`kubevirt_*`/`extra_metric_*` filler carry no `profile` label.
+
+| Metric | Breakdown labels (per series) | Series/block |
+| --- | --- | --- |
+| `acm_rs:cluster:*`, `acm_rs_vm:cluster:*` | `profile` | `len(profiles)` |
+| `acm_rs:namespace:*` | `namespace`, `profile` | `NUM_NAMESPACES × len(profiles)` |
+| `acm_rs_vm:namespace:*` | `namespace`, `name` (per-VM), `profile` | `NUM_NAMESPACES × NUM_NAMES × len(profiles)` |
+| `kubevirt_*`, `extra_metric_*` | `namespace`, `name` | `NUM_NAMESPACES × NUM_NAMES` |
+
+The non-VM namespace level additionally emits `acm_rs:namespace:cpu_request_hard`
+and `acm_rs:namespace:memory_request_hard` (the ResourceQuota ceiling the
+namespaces dashboard's "hard limit" panels query). Each `*_recommendation`
+series is derived from its `*_usage` sibling and scaled by `110/100`, so
+`recommendation = usage × 1.10` holds exactly per series (not an independent
+random draw).
+
+The `custom-continous-1-week-full` profile emits the label set the real ACM
+right-sizing recording rules / dashboards expect, with `cluster` and
+`aggregation` supplied as block (external) labels via `--labels`. `profile` is
+per-series (one copy of each metric per `Max OverAll`/`P95`/`P99`):
+
+| Metric | Breakdown labels (per series) |
+| --- | --- |
+| `acm_rs:cluster:*` | `profile` |
+| `acm_rs:namespace:*` | `namespace`, `profile` |
+| `acm_rs:workload:*` | `namespace`, `workload`, `workload_type`, `profile` |
+| `acm_rs:pod:*` | `namespace`, `pod`, `workload`, `workload_type`, `profile` |
+
+Each level carries the six measures `cpu_request`, `cpu_usage`,
+`cpu_recommendation`, `memory_request`, `memory_usage`, `memory_recommendation`;
+the namespace level adds `cpu_request_hard`/`memory_request_hard`. Every metric
+is emitted once per profile, `*_recommendation` tracks `*_usage × 1.10`, and pods
+nest under workloads (a pod's `workload`/`workload_type` labels match its
+parent). Generate blocks for it with:
+
+```bash
+./run_thanosbench_full.sh "1,3"   # inclusive cluster range
+```
+
+#### Environment variables (cardinality & values)
+
+All profiles read these (unset/empty uses the default; a non-empty but invalid
+value fails fast with an error):
+
+| Variable | Default | Applies to | Meaning |
+| --- | --- | --- | --- |
+| `MIN_GAUGE` | `2.0` | all custom | minimum gauge value (CPU / non-memory measures, in cores) |
+| `MAX_GAUGE` | `8.0` | all custom | maximum gauge value (CPU / non-memory measures, in cores) |
+| `MEM_MIN_GAUGE` | `536870912` (512 MiB) | all custom | minimum gauge value for `*memory*` measures, in **bytes** |
+| `MEM_MAX_GAUGE` | `34359738368` (32 GiB) | all custom | maximum gauge value for `*memory*` measures, in **bytes** |
+| `NUM_NAMESPACES` | `50` | all custom | namespaces per cluster |
+| `NUM_NAMES` | `200` | `custom-continous-1-week[-vm]` | `name` dimension per namespace |
+| `NUM_WORKLOADS` | `10` | `-full` | workloads per namespace |
+| `NUM_PODS` | `20` | `-full` | pods per workload |
+| `NUM_EXTRA_METRICS` | `200` (`-full`: `0`) | all custom | synthetic `extra_metric_*` filler load |
+
+To keep the process from running out of memory (blocks are built in memory before
+being flushed), each profile refuses to plan more than ~5,000,000 series per
+block and prints the projected series count to stderr. Lower the `NUM_*` values
+if you hit the cap.
+
 ### 2. Store Data Blocks in S3
 
 1. Ensure the S3 bucket directory is cleared of old data:

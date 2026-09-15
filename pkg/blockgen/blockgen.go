@@ -64,7 +64,33 @@ type SeriesSpec struct {
 
 	MinTime, MaxTime int64
 
+	// SeedName, when non-empty, is used in place of this series' __name__ value
+	// when deriving its (otherwise label-stable) RNG seed. Two series that are
+	// identical except for __name__ can thus be made to share one value stream —
+	// e.g. an `acm_rs:namespace:cpu_recommendation` series seeded from its
+	// `acm_rs:namespace:cpu_usage` sibling so it tracks the same usage curve. The
+	// stored __name__ label is unaffected; only the seed changes.
+	SeedName string `yaml:"seedName,omitempty"`
+
+	// ValueScale, when non-zero, multiplies every generated sample value by the
+	// given factor. Combined with SeedName it expresses a deterministic ratio
+	// between two series (the ACM right-sizing recommendation = usage * 1.10).
+	// A zero value leaves samples unscaled (the default).
+	ValueScale float64 `yaml:"valueScale,omitempty"`
+
 	seriesgen.Characteristics `yaml:",inline"`
+}
+
+// scaledIterator multiplies the values of an underlying iterator by a constant
+// factor, leaving timestamps untouched. It backs SeriesSpec.ValueScale.
+type scaledIterator struct {
+	seriesgen.SeriesIterator
+	scale float64
+}
+
+func (s *scaledIterator) At() (int64, float64) {
+	t, v := s.SeriesIterator.At()
+	return t, v * s.scale
 }
 
 func durToMilis(t time.Duration) int64 {
@@ -131,9 +157,16 @@ func (s *blockSeriesSet) Next() bool {
 
 	b := make([]byte, 0, 1024)
 	for _, v := range lset {
+		value := v.Value
+		// SeedName lets a series borrow another series' seed by substituting its
+		// __name__ during hashing, so derived series (e.g. recommendation) share a
+		// value stream with their source (usage). Only the hash input changes.
+		if v.Name == labels.MetricName && series.SeedName != "" {
+			value = series.SeedName
+		}
 		b = append(b, v.Name...)
 		b = append(b, '\xff')
-		b = append(b, v.Value...)
+		b = append(b, value...)
 		b = append(b, '\xff')
 	}
 	for _, v := range s.extLset {
@@ -153,6 +186,9 @@ func (s *blockSeriesSet) Next() bool {
 	if err != nil {
 		s.err = err
 		return false
+	}
+	if series.ValueScale != 0 && series.ValueScale != 1 {
+		iter = &scaledIterator{SeriesIterator: iter, scale: series.ValueScale}
 	}
 	s.curr = seriesgen.NewSeriesGen(lset, iter)
 	return true
