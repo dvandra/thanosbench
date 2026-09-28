@@ -142,6 +142,34 @@ Generate blocks for it with:
 ./run_thanosbench_full.sh "1,3"   # inclusive cluster range
 ```
 
+For Category 1 (20 managed clusters, 100 namespaces per cluster, 10 workloads
+per namespace, and 10 pods per workload), run:
+
+```bash
+NUM_NAMESPACES=100 NUM_WORKLOADS=10 NUM_PODS=10 NUM_EXTRA_METRICS=0 ./run_thanosbench_full.sh "1,20"
+```
+
+This creates `20 × 100 × 10 × 10 = 200,000` pod identities across the 20
+clusters. The generated blocks contain multiple right-sizing metric series per
+pod (six measures and three right-sizing profiles), so the TSDB series count is
+larger than 200,000 by design.
+
+Set NUM_WEEKS=13 for approximately 90 days (13 weekly periods, or about 91
+days):
+
+```bash
+NUM_NAMESPACES=100 NUM_WORKLOADS=10 NUM_PODS=10 NUM_EXTRA_METRICS=200 NUM_WEEKS=13 ./run_thanosbench_full.sh "1,20"
+```
+
+For a reusable one-command run, edit the variables at the top of
+`run_category1.sh` and execute:
+
+```bash
+./run_category1.sh
+```
+
+The wrapper rebuilds `thanosbench` automatically before generating the blocks.
+
 #### Environment variables (cardinality & values)
 
 All profiles read these (unset/empty uses the default; a non-empty but invalid

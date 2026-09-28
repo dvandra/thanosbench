@@ -14,9 +14,10 @@ set -euo pipefail
 #   acm_rs:pod:*        -> namespace, pod, workload, workload_type, profile
 #
 # Usage: ./run_thanosbench_full.sh "<start>,<end>"   # inclusive cluster range
-#        ./run_thanosbench_full.sh "1,3"
+#        NUM_NAMESPACES=100 NUM_WORKLOADS=10 NUM_PODS=10 \
+#          ./run_thanosbench_full.sh "1,20"
 
-# Variables
+# Variables. NUM_PODS is pods per workload, not pods per namespace.
 range="${1:-1}"
 
 # Parse the range (defaults to a single cluster when omitted)
@@ -25,12 +26,18 @@ start=$(printf "%d" "${start:-1}")
 end=$(printf "%d" "${end:-$start}")
 
 # Cardinality knobs (see pkg/blockgen/profiles.go: rightSizingLeveled).
-NUM_NAMESPACES=40   # namespaces per cluster
-NUM_WORKLOADS=10    # workloads per namespace
-NUM_PODS=20         # pods per workload (pods nest under their workload)
-NUM_EXTRA_METRICS=0 # optional synthetic filler load; 0 keeps blocks lean
-NUM_POD_METRICS=0   # optional per-pod filler; pinned so an exported value can't leak in
-NUM_CLUSTER_METRICS=0 # optional cluster-level filler; pinned for the same reason
+# Defaults preserve the original runner behavior; override these for a
+# category-sized run, e.g. 20 x 100 x 10 x 10 = 200,000 pods total.
+NUM_NAMESPACES="${NUM_NAMESPACES:-40}"   # namespaces per cluster
+NUM_WORKLOADS="${NUM_WORKLOADS:-10}"     # workloads per namespace
+NUM_PODS="${NUM_PODS:-20}"               # pods per workload
+NUM_EXTRA_METRICS="${NUM_EXTRA_METRICS:-0}" # optional synthetic filler load; 0 keeps blocks lean
+NUM_POD_METRICS="${NUM_POD_METRICS:-0}"  # optional per-pod filler
+NUM_CLUSTER_METRICS="${NUM_CLUSTER_METRICS:-0}" # optional cluster-level filler
+MIN_GAUGE_MIN="${MIN_GAUGE_MIN:-2.1}"
+MIN_GAUGE_MAX="${MIN_GAUGE_MAX:-4.6}"
+MAX_GAUGE_MIN="${MAX_GAUGE_MIN:-10.6}"
+MAX_GAUGE_MAX="${MAX_GAUGE_MAX:-19.8}"
 
 # Weekly --max-time values: the WEEKS weeks ending at END_EPOCH (default: today
 # 00:00 UTC), oldest first. Keeping the data recent keeps it inside the hub's
@@ -54,8 +61,8 @@ for ((cluster = start; cluster <= end; cluster++)); do
       PROFILE="custom-continous-1-week-full"
       MAX_TIME=${MAX_TIMES[$i]}
 
-      MIN_GAUGE=$(random_in_range 2.1 4.6)
-      MAX_GAUGE=$(random_in_range 10.6 19.8)
+      MIN_GAUGE=$(random_in_range "$MIN_GAUGE_MIN" "$MIN_GAUGE_MAX")
+      MAX_GAUGE=$(random_in_range "$MAX_GAUGE_MIN" "$MAX_GAUGE_MAX")
 
       # Output directory based on cluster
       OUTPUT_DIR="./new-run/cluster-${cluster}"
@@ -67,7 +74,8 @@ for ((cluster = start; cluster <= end; cluster++)); do
       # is emitted per-series by the profile (Max OverAll/P95/P99), so it must
       # NOT be passed via --labels here.
       NUM_NAMESPACES=$NUM_NAMESPACES NUM_WORKLOADS=$NUM_WORKLOADS NUM_PODS=$NUM_PODS \
-        NUM_EXTRA_METRICS=$NUM_EXTRA_METRICS NUM_POD_METRICS=$NUM_POD_METRICS NUM_CLUSTER_METRICS=$NUM_CLUSTER_METRICS MIN_GAUGE=$MIN_GAUGE MAX_GAUGE=$MAX_GAUGE \
+        NUM_EXTRA_METRICS=$NUM_EXTRA_METRICS NUM_POD_METRICS=$NUM_POD_METRICS NUM_CLUSTER_METRICS=$NUM_CLUSTER_METRICS \
+        MIN_GAUGE=$MIN_GAUGE MAX_GAUGE=$MAX_GAUGE \
         ./thanosbench block plan -p "$PROFILE" \
         --labels "cluster=\"ac-test-man-${cluster}\"" \
         --labels "aggregation=\"1d\"" \
