@@ -54,8 +54,8 @@ READY=0; for i in $(seq 1 30); do curl -s -o /dev/null "http://localhost:${LOCAL
 PORT="${LOCAL_PORT}" DAYS="${DAYS}" STEP="${STEP}" \
 N="${NUM_NAMESPACES}" W="${NUM_WORKLOADS}" P="${NUM_PODS}" \
 CLUSTERS="${CLUSTERS}" MIN_DATA_EPOCH="${MIN_DATA_EPOCH}" MAX_DATA_EPOCH="${MAX_DATA_EPOCH}" \
-python3 <<'PY'
-import json,os,sys,time,urllib.parse,urllib.request
+python3 -u <<'PY'
+import json,os,sys,time,urllib.error,urllib.parse,urllib.request
 port=os.environ["PORT"]; days=int(os.environ["DAYS"]); step=int(os.environ["STEP"])
 N,W,P=int(os.environ["N"]),int(os.environ["W"]),int(os.environ["P"])
 clusters=os.environ["CLUSTERS"].split(); ncl=len(clusters)
@@ -71,6 +71,9 @@ def qr(expr,msr=None,s=None,e=None):
         with urllib.request.urlopen(base+"?"+urllib.parse.urlencode(p),timeout=300) as r:
             d=json.load(r)
         return d.get("data",{}).get("result",[]) if d.get("status")=="success" else []
+    except urllib.error.HTTPError as ex:
+        body=ex.read(2048).decode("utf-8","replace").strip()
+        print(f"    query error: {ex}"+(f" — {body}" if body else "")); return []
     except Exception as ex:
         print(f"    query error: {ex}"); return []
 def vmax(res): return max((float(v[1]) for s in res for v in s["values"]), default=None)
@@ -136,10 +139,14 @@ print("== 3. recommendation/usage ratio == ")
 for lvl in ("cluster","pod"):
     s2=sel if lvl=="cluster" else f'cluster="{rep}"'
     for r in ("cpu","memory"):
-        res=qr(f'acm_rs:{lvl}:{r}_recommendation{{{s2}}} / acm_rs:{lvl}:{r}_usage{{{s2}}}')
-        lo,hi=vmin(res),vmax(res)
-        ok=res and lo is not None and 1.0999<=lo and hi<=1.1001
-        lbl=f"{lvl} {r}: ratio in [1.0999,1.1001] (min={lo},max={hi}, series={len(res)})"
+        ratio=f'acm_rs:{lvl}:{r}_recommendation{{{s2}}} / acm_rs:{lvl}:{r}_usage{{{s2}}}'
+        # Compute the cross-series extrema in Thanos. Returning every pod/profile at
+        # every 6h step would materialize millions of response points merely to find
+        # two numbers locally; cardinality was already asserted in section 1.
+        lo_res=qr(f'min({ratio})'); hi_res=qr(f'max({ratio})')
+        lo,hi=vmin(lo_res),vmax(hi_res)
+        ok=lo_res and hi_res and lo is not None and 1.0999<=lo and hi<=1.1001
+        lbl=f"{lvl} {r}: ratio in [1.0999,1.1001] (min={lo},max={hi})"
         if lvl=="pod": lbl+=f" [{rep} only]"
         check(ok,lbl)
 

@@ -164,6 +164,23 @@ loss. `validate_compaction_180day.sh` therefore requires gap-free full raw cover
 age-eligible 5m/1h boundaries (40 hours and 10 days), rather than incorrectly requiring
 each downsample tier to cover fresh data or short edge blocks.
 
+On a cold-cache post-downsampling validation, Store Gateway shards peaked near 3.5 CPU
+cores and 9.1 GiB each, Query near 2.1 GiB, and Query Frontend near 1.9 GiB. Each Store
+Gateway requested only 100m CPU/1 GiB memory and had no limits. The original QE ratio
+assertion also tried to return all three profiles for every pod at every 6-hour step
+(about 6.56 million response points per resource), so the validator now computes global
+ratio extrema in Thanos and returns only the aggregate series.
+
+The post-downsampling rerun exposed a test-environment ceiling rather than a data or
+dashboard defect: all functional assertions passed except the broad pod ratio scans,
+whose HTTP 500 body identified a cluster-DNS lookup timeout. The single node had recently
+re-registered; its only DNS pod then failed readiness/liveness probes, and the API later
+hit TLS handshake timeouts under load. The profile-scoped dashboard queries had passed.
+Use this SNO only for one-cluster functional validation, not as the 20/100/300-cluster
+performance target. Run those categories on the intended production-size hub, and track
+component peaks plus cold/warm latency separately; resource requests are not a useful
+capacity estimate for this workload.
+
 Extrapolated from measured throughput; the two big unknowns are **port-forward
 throughput** (~10–40 MB/s) and the **shared compactor's** speed.
 
