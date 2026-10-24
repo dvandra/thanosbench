@@ -42,6 +42,14 @@ WORK="${WORK:-./gen-work}"
 TB="${TB:-$(cd "$(dirname "$0")/.." && pwd)/thanosbench}"
 DRY_RUN="${DRY_RUN:-0}"
 
+# generate_cw changes into the per-week directory before invoking thanosbench.
+# Keep WORK absolute so --output.dir and every state/log path still refer to the
+# same run directory from inside that subshell.
+case "$WORK" in
+  /*) ;;
+  *) WORK="$(pwd)/${WORK#./}" ;;
+esac
+
 BUCKET="${BUCKET:-}"
 SHARED_PREFIX="${SHARED_PREFIX:-}"                   # e.g. rs-perf-shared/20c-180d-2026-09-28
 HUB_PREFIX="${HUB_PREFIX:-}"                         # optional: the hub's own Thanos prefix (server-side copy)

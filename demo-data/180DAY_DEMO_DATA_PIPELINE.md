@@ -131,6 +131,39 @@ seam gaps from the first-sample shave; gaps are fine, overlaps would halt the co
 
 ## 4. Timing expectations
 
+For the S3 distribution workflow, keep master creation and hub loading as separate
+phases. `generate_and_publish.sh` should publish only to the immutable master
+(`HUB_PREFIX` unset). After certification, copy the entire master into an empty
+hub-owned prefix with block data first and every `meta.json` last. This avoids serializing
+a hub copy behind every generated cluster-week and keeps the master safe from compaction.
+
+**Measured one-cluster S3 pilot (2026-10-24, recommended filler):** median generation
+was 59 s per cluster-week, local-to-master upload was 157 s per cluster-week, and the
+old inline per-week master-to-hub copy was another 142 s. Three uploads were concurrent.
+The inline hub-copy stage is therefore intentionally omitted for future master builds;
+the completed master is bulk-copied once when a hub test is requested.
+
+After loading that pilot into the hub, the deployed Perses overview PromQL was measured
+over the full 182-day range. Workload queries returned one aggregate in 7.09-7.49 s.
+Pod queries returned 3,000 grouped pods in 77.26-87.07 s (Max OverAll 77.46 s,
+P95 87.07 s, P99 77.26 s). These are the single-cluster baselines for the 20/100/300
+scale tests; record cold and warm runs separately because query-frontend caching can
+materially change subsequent latency.
+
+During four-way 5m downsampling of the same pilot, the compactor reached about 2.94 CPU
+cores and 17.5 GiB memory. Its deployed request was only 500m/1 GiB (with no limits),
+while the single node had 15.5 cores and about 61 GiB allocatable memory (about 37 GiB
+in use at the sample). Treat node headroom, peak compactor RSS, queue depth, and time to
+settle as required measurements for every 20/100/300-cluster run. Do not raise
+`--downsample.concurrency` without first proving the resulting memory peak fits the node.
+
+The settled pilot had 29 live raw blocks covering 182.0 days, 26 5m blocks covering
+181.1 days, and 13 1h blocks spanning the age-eligible 179.1 days. The 1h tier contained
+twelve 48.1-hour gaps that Thanos serves from the finer 5m/raw tiers; these are not data
+loss. `validate_compaction_180day.sh` therefore requires gap-free full raw coverage and
+age-eligible 5m/1h boundaries (40 hours and 10 days), rather than incorrectly requiring
+each downsample tier to cover fresh data or short edge blocks.
+
 Extrapolated from measured throughput; the two big unknowns are **port-forward
 throughput** (~10–40 MB/s) and the **shared compactor's** speed.
 

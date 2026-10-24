@@ -4,8 +4,11 @@
 > findings addressed. See "Review findings" section at the bottom for traceability.
 >
 > **Status:** partly implemented. `generate_and_publish.sh` covers the generator side
-> (per-block upload with `meta.json` last, `manifest.json` written last, optional
-> server-side copy into a hub prefix); `configure_hub_s3.sh` points a hub at its prefix.
+> (per-block upload with `meta.json` last and `manifest.json` written last).
+> Master-production runs leave `HUB_PREFIX` unset. A completed master is bulk-copied,
+> data first and all `meta.json` files last, into a private hub prefix;
+> `copy_master_to_hub.sh` performs and verifies that copy, and
+> `configure_hub_s3.sh` then points that hub at only its private copy.
 > `load_from_s3.sh` and `validate_s3_source.sh` (checksums, IAM model) are not built
 > yet; today a consumer copies the blocks server-side as described in `README.md`.
 
@@ -36,8 +39,8 @@ Shared S3 bucket (single source of truth, read-only for consumers via IAM)
   └─► Team C  →  bash load_from_s3.sh  →  their thanos bucket
 ```
 
-Pull-and-push model (each team downloads then re-uploads to their own bucket) is
-the correct choice because:
+Copy-on-consume is the correct model. For S3 consumers this is an S3-to-S3 copy into
+their own bucket/prefix; MinIO consumers download and re-upload. In both cases:
 - Direct store-gateway pointing at shared S3 creates an unsolvable compactor isolation
   problem (multiple compactors racing on the same bucket → HALT within hours).
 - Pull-and-push makes each team's copy independent and disposable; their own compactor
@@ -45,6 +48,19 @@ the correct choice because:
 - The shared S3 is unreachable by any Thanos component (never wired to any
   thanos-object-storage secret); IAM prevents consumer writes.
 - Each team's copy survives the shared S3 becoming unavailable after initial load.
+
+### Lifecycle boundary: master versus hub copy
+
+- A master prefix is immutable once `manifest.json` is present. No Thanos component is
+  ever configured to use it.
+- A hub copy is private and mutable. Thanos compaction, downsampling, deletion marks,
+  Receive, and Rule output are expected to change it and expand its storage footprint.
+- Copy into an empty hub prefix in two phases: all files except `meta.json` first, then
+  all `*/meta.json`. Point the hub at the prefix only after both phases succeed.
+- Never reuse one mutable prefix across hubs and never copy a compacted hub prefix back
+  over a master.
+- The 20/100/300-cluster categories are separate masters. Consumers copy only the
+  category they need into a separately named hub prefix.
 
 ---
 
