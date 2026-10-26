@@ -863,6 +863,14 @@ func rightSizingLeveled(ranges []time.Duration) PlanFn {
 		if err != nil {
 			return err
 		}
+		numPodMetrics, err := getEnvInt("NUM_POD_METRICS", 0)
+		if err != nil {
+			return err
+		}
+		numClusterMetrics, err := getEnvInt("NUM_CLUSTER_METRICS", 0)
+		if err != nil {
+			return err
+		}
 
 		// RS_SCRAPE_INTERVAL controls the sample interval of acm_rs:* series.
 		// The ACM right-sizing recording rules evaluate once per day, so 24h is
@@ -903,11 +911,12 @@ func rightSizingLeveled(ranges []time.Duration) PlanFn {
 		}
 		// acm_rs series are emitted once per profile; filler is not.
 		// The +podInfoSeries accounts for the acm_rs:pod:info metadata metric.
-		projected := len(selectedRSProfiles())*(len(rsMeasures)*perMeasure+namespaceHard+podInfoSeries) + numExtra*numNamespaces + vmProjected
-		fmt.Fprintf(os.Stderr, "rightSizingLeveled: %d namespaces x %d workloads x %d pods x %d VMs x %d profiles (+%d filler, +info) = %d series/block, acm_rs sample interval %s\n",
-			numNamespaces, numWorkloads, numPods, numVMs, len(selectedRSProfiles()), numExtra, projected, rsScrapeInterval)
+		podFillerSeries := numPodMetrics * numNamespaces * numWorkloads * numPods
+		projected := len(selectedRSProfiles())*(len(rsMeasures)*perMeasure+namespaceHard+podInfoSeries) + numExtra*numNamespaces + podFillerSeries + numClusterMetrics + vmProjected
+		fmt.Fprintf(os.Stderr, "rightSizingLeveled: %d namespaces x %d workloads x %d pods x %d VMs x %d profiles (+%d ns filler, +%d pod filler, +%d cluster filler, +info) = %d series/block, acm_rs sample interval %s\n",
+			numNamespaces, numWorkloads, numPods, numVMs, len(selectedRSProfiles()), numExtra, numPodMetrics, numClusterMetrics, projected, rsScrapeInterval)
 		if projected > maxSeriesPerBlock {
-			return fmt.Errorf("projected %d series/block exceeds cap %d: lower NUM_NAMESPACES/NUM_WORKLOADS/NUM_PODS/NUM_VMS/NUM_EXTRA_METRICS", projected, maxSeriesPerBlock)
+			return fmt.Errorf("projected %d series/block exceeds cap %d: lower NUM_NAMESPACES/NUM_WORKLOADS/NUM_PODS/NUM_VMS/NUM_EXTRA_METRICS/NUM_POD_METRICS/NUM_CLUSTER_METRICS", projected, maxSeriesPerBlock)
 		}
 
 		randomJitter := rand.Intn(10) + 1
@@ -1040,6 +1049,34 @@ func rightSizingLeveled(ranges []time.Duration) PlanFn {
 						{Name: "namespace", Value: fmt.Sprintf("namespace-%d", ni)},
 					}, extraSpec)
 				}
+			}
+
+			// Optional per-pod filler (NUM_POD_METRICS), one series per pod per
+			// metric, on the same pods as the acm_rs:pod series. Real clusters
+			// send most of their other series per pod/container (kube_pod_*,
+			// container_*), so this reproduces that index shape — many distinct
+			// pod values — and not just the series count.
+			for e := 1; e <= numPodMetrics; e++ {
+				name := fmt.Sprintf("extra_pod_metric_%d", e)
+				for ni := 0; ni < numNamespaces; ni++ {
+					ns := fmt.Sprintf("namespace-%d", ni)
+					for wi := 0; wi < numWorkloads; wi++ {
+						wl := fmt.Sprintf("workload-%d", wi)
+						for pi := 0; pi < numPods; pi++ {
+							add(name, labels.Labels{
+								{Name: "container", Value: "app"},
+								{Name: "namespace", Value: ns},
+								{Name: "pod", Value: fmt.Sprintf("%s-%d", wl, pi)},
+							}, extraSpec)
+						}
+					}
+				}
+			}
+
+			// Optional cluster-level filler (NUM_CLUSTER_METRICS), one series per
+			// metric; cluster identity comes from the block labels.
+			for e := 1; e <= numClusterMetrics; e++ {
+				add(fmt.Sprintf("extra_cluster_metric_%d", e), nil, extraSpec)
 			}
 
 			// VM right-sizing metrics (acm_rs_vm:*) when NUM_VMS > 0.

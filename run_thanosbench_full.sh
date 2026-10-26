@@ -35,7 +35,9 @@ NUM_NAMESPACES="${NUM_NAMESPACES:-40}"   # namespaces per cluster
 NUM_WORKLOADS="${NUM_WORKLOADS:-10}"    # workloads per namespace
 NUM_PODS="${NUM_PODS:-20}"               # pods per workload
 NUM_VMS="${NUM_VMS:-50}"                 # VMs per namespace (0 = skip VM metrics)
-NUM_EXTRA_METRICS="${NUM_EXTRA_METRICS:-0}" # optional synthetic filler load
+NUM_EXTRA_METRICS="${NUM_EXTRA_METRICS:-0}" # optional namespace-level filler
+NUM_POD_METRICS="${NUM_POD_METRICS:-0}"   # optional per-pod filler (e.g. 20)
+NUM_CLUSTER_METRICS="${NUM_CLUSTER_METRICS:-0}" # optional cluster-level filler (e.g. 154)
 RS_SCRAPE_INTERVAL="${RS_SCRAPE_INTERVAL:-1h}" # acm_rs sample interval (1h = fast; 15m = default dense)
 NUM_WEEKS="${NUM_WEEKS:-26}"             # weekly periods to generate (26 ≈ 180 days)
 OUTPUT_ROOT="${OUTPUT_ROOT:-./new-run}"
@@ -90,7 +92,9 @@ for ((cluster = start; cluster <= end; cluster++)); do
       # is emitted per-series by the profile (Max OverAll/P95/P99), so it must
       # NOT be passed via --labels here.
       NUM_NAMESPACES=$NUM_NAMESPACES NUM_WORKLOADS=$NUM_WORKLOADS NUM_PODS=$NUM_PODS \
-        NUM_VMS=$NUM_VMS NUM_EXTRA_METRICS=$NUM_EXTRA_METRICS RS_SCRAPE_INTERVAL=$RS_SCRAPE_INTERVAL \
+        NUM_VMS=$NUM_VMS NUM_EXTRA_METRICS=$NUM_EXTRA_METRICS \
+        NUM_POD_METRICS=$NUM_POD_METRICS NUM_CLUSTER_METRICS=$NUM_CLUSTER_METRICS \
+        RS_SCRAPE_INTERVAL=$RS_SCRAPE_INTERVAL \
         MIN_GAUGE=$MIN_GAUGE MAX_GAUGE=$MAX_GAUGE \
         ./thanosbench block plan -p "$PROFILE" \
         --labels "cluster=\"ac-test-man-${cluster}\"" \
