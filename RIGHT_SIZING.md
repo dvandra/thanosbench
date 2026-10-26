@@ -284,21 +284,34 @@ about 5–6× the uploaded size.
 5. Ensure that the MultiClusterObservability CR has the following values under the metricObjectStorage:
     ```
     metricObjectStorage:
-      key: config
+      key: thanos.yaml
       name: thanos-object-storage
     ```
+
+    Verify with:
+
+    ```bash
+    oc get multiclusterobservability observability \
+      -o jsonpath='key: {.spec.storageConfig.metricObjectStorage.key}{"\n"}name: {.spec.storageConfig.metricObjectStorage.name}{"\n"}'
+    ```
+
+    > **Important:** The `key` value must match the data key inside the Secret.
+    > The Secret above uses `thanos.yaml` as the data key, so set `key: thanos.yaml`
+    > in the CR. If the CR uses `key: config`, rename the data key in the Secret to
+    > `config` accordingly.
+
 6. Restart the Thanos components to apply the changes:
 
     ```bash
     kubectl get pods -n open-cluster-management-observability | grep thanos | awk '{print $1}' | xargs kubectl delete pod -n open-cluster-management-observability
     ```
 
-### 4. Visualize Data in Grafana
+### 4. Verify the Thanos Stack
 
 1. Verify that the Thanos Compactor is receiving the Thanos blocks:
 
     ```bash
-    kubectl port-forward observability-thanos-compact-0 -n open-cluster-management-observability 8080:10902
+    oc port-forward observability-thanos-compact-0 -n open-cluster-management-observability 8080:10902
     ```
 
     - Open [https://localhost:8080](https://localhost:8080) to view the Thanos Compactor UI. You should see blocks for the dates defined in `thanosbench`.
@@ -306,11 +319,181 @@ about 5–6× the uploaded size.
 2. Verify the metrics in the Thanos Querier pod:
 
     ```bash
-    kubectl port-forward <observability-thanos-querier-pod> -n open-cluster-management-observability 9090:9090
+    oc port-forward -n open-cluster-management-observability \
+      $(oc get pods -n open-cluster-management-observability -l app.kubernetes.io/name=thanos-query -o jsonpath='{.items[0].metadata.name}') \
+      9090:9090
     ```
 
-    - You should see the metrics defined in the profile.
+    - Open [http://localhost:9090](http://localhost:9090) and query a metric like `acm_rs:cluster:cpu_usage` to confirm data is present.
 
-3. Access the Grafana UI:
+### 5. Visualize Data in Perses
 
-    - Select the appropriate dashboard and filter the date range to match the generated blocks.
+The ACM observability operator already runs a Thanos Querier in
+`open-cluster-management-observability`. Perses connects to it as a standard
+Prometheus-compatible datasource.
+
+#### 5a. Deploy Perses on the cluster
+
+```bash
+oc new-project perses
+```
+
+Create the Perses deployment:
+
+```bash
+cat <<'EOF' | oc apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: perses
+  namespace: perses
+  labels:
+    app: perses
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: perses
+  template:
+    metadata:
+      labels:
+        app: perses
+    spec:
+      containers:
+        - name: perses
+          image: persesdev/perses:latest
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: perses
+  namespace: perses
+spec:
+  selector:
+    app: perses
+  ports:
+    - port: 8080
+      targetPort: 8080
+EOF
+```
+
+Expose Perses via an OpenShift Route:
+
+```bash
+oc -n perses create route edge perses \
+  --service=perses --port=8080 --insecure-policy=Redirect
+```
+
+Get the Perses URL:
+
+```bash
+PERSES_URL=$(oc get route perses -n perses -o jsonpath='{.spec.host}')
+echo "Perses UI: https://$PERSES_URL"
+```
+
+#### 5b. Allow Perses to reach the Thanos Querier (cross-namespace networking)
+
+Perses needs to reach the Thanos Querier service in `open-cluster-management-observability`.
+On OpenShift, cross-namespace service DNS works out of the box. The internal URL is:
+
+```
+http://observability-thanos-query.open-cluster-management-observability.svc.cluster.local:9090
+```
+
+Verify the service name:
+
+```bash
+oc get svc -n open-cluster-management-observability | grep thanos-query
+```
+
+Use the actual service name from the output. It is typically
+`observability-thanos-query` (port `9090` for HTTP).
+
+#### 5c. Create a Project and Datasource in Perses
+
+**Option A — Via the Perses UI:**
+
+1. Open `https://<PERSES_URL>`
+2. Click **+ Create** → name the project, e.g. `acm-rightsizing`
+3. Go to the **Datasources** tab → **Add Datasource**
+4. Fill in:
+   - **Name:** `thanos-acm`
+   - **Set as default:** toggle on
+   - **Source:** `Prometheus Datasource`
+   - **HTTP Settings:** select `Proxy`
+   - **URL:** `http://observability-thanos-query.open-cluster-management-observability.svc.cluster.local:9090`
+5. Click **Add** to save
+
+**Option B — Via the API:**
+
+```bash
+PERSES_URL=$(oc get route perses -n perses -o jsonpath='{.spec.host}')
+
+# Create project
+curl -sk -X PUT "https://$PERSES_URL/api/v1/projects/acm-rightsizing" \
+  -H 'Content-Type: application/json' \
+  -d '{"kind":"Project","metadata":{"name":"acm-rightsizing"},"spec":{}}'
+
+# Create datasource (Proxy mode — recommended)
+curl -sk -X PUT "https://$PERSES_URL/api/v1/projects/acm-rightsizing/datasources/thanos-acm" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "kind": "Datasource",
+    "metadata": {
+      "name": "thanos-acm",
+      "project": "acm-rightsizing"
+    },
+    "spec": {
+      "default": true,
+      "plugin": {
+        "kind": "PrometheusDatasource",
+        "spec": {
+          "proxy": {
+            "kind": "HTTPProxy",
+            "spec": {
+              "url": "http://observability-thanos-query.open-cluster-management-observability.svc.cluster.local:9090"
+            }
+          }
+        }
+      }
+    }
+  }'
+```
+
+> **Tip:** Use Proxy mode so the Perses server forwards requests to Thanos
+> on your behalf. This avoids CORS issues that occur with Direct access mode
+> when the browser cannot reach the Querier directly.
+
+#### 5d. Create a Dashboard
+
+**Via the UI:**
+
+1. Go to **Dashboards** tab → **Add Dashboard** → name it e.g. `ACM Right-Sizing`
+2. Add variables (dropdowns) for filtering:
+   - **`$cluster`** — Prometheus Label Values, label `cluster`, matcher `acm_rs:cluster:cpu_usage`
+   - **`$profile`** — Prometheus Label Values, label `profile`, matcher `acm_rs:cluster:cpu_usage`
+   - **`$namespace`** — Prometheus Label Values, label `namespace`, matcher `acm_rs:namespace:cpu_usage{cluster="$cluster"}`
+3. Add panels (Time Series Chart + Prometheus Time Series Query):
+
+| Panel name | PromQL expression |
+|---|---|
+| Cluster CPU Usage | `acm_rs:cluster:cpu_usage{profile="$profile", cluster="$cluster"}` |
+| Cluster CPU Recommendation | `acm_rs:cluster:cpu_recommendation{profile="$profile", cluster="$cluster"}` |
+| Cluster Memory Usage | `acm_rs:cluster:memory_usage{profile="$profile", cluster="$cluster"}` |
+| Namespace CPU Usage | `acm_rs:namespace:cpu_usage{profile="$profile", cluster="$cluster", namespace="$namespace"}` |
+| Namespace Memory Recommendation | `acm_rs:namespace:memory_recommendation{profile="$profile", cluster="$cluster", namespace="$namespace"}` |
+| Namespace CPU Quota Headroom | `acm_rs:namespace:cpu_request_hard{profile="$profile", cluster="$cluster"} - acm_rs:namespace:cpu_usage{profile="$profile", cluster="$cluster"}` |
+| Top 10 Pods by Memory | `topk(10, acm_rs:pod:memory_usage{profile="$profile", cluster="$cluster"})` |
+| Workload CPU Request vs Usage | `acm_rs:workload:cpu_request{profile="$profile"} / acm_rs:workload:cpu_usage{profile="$profile"}` |
+
+4. Set the dashboard **time range** to match the dates of the generated blocks
+5. Click **Save**
+
+### (Optional) Visualize Data in Grafana
+
+The Grafana UI bundled with the ACM observability stack can also be used:
+
+1. Access the Grafana route provided by the observability operator.
+2. Select the appropriate dashboard and filter the date range to match the generated blocks.

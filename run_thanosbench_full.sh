@@ -16,6 +16,9 @@ set -euo pipefail
 # Usage: ./run_thanosbench_full.sh "<start>,<end>"   # inclusive cluster range
 #        NUM_NAMESPACES=100 NUM_WORKLOADS=10 NUM_PODS=10 \
 #          ./run_thanosbench_full.sh "1,20"
+# To generate one right-sizing profile only, set RS_PROFILE to Max OverAll,
+# P95, or P99. OUTPUT_ROOT can be used to keep separate profile output trees:
+#   RS_PROFILE=P95 OUTPUT_ROOT=./new-run-p95 ./run_thanosbench_full.sh "1,20"
 
 # Variables. NUM_PODS is pods per workload, not pods per namespace.
 range="${1:-1}"
@@ -29,24 +32,36 @@ end=$(printf "%d" "${end:-$start}")
 # Defaults preserve the original runner behavior; override these for a
 # category-sized run, e.g. 20 x 100 x 10 x 10 = 200,000 pods total.
 NUM_NAMESPACES="${NUM_NAMESPACES:-40}"   # namespaces per cluster
-NUM_WORKLOADS="${NUM_WORKLOADS:-10}"     # workloads per namespace
+NUM_WORKLOADS="${NUM_WORKLOADS:-10}"    # workloads per namespace
 NUM_PODS="${NUM_PODS:-20}"               # pods per workload
-NUM_EXTRA_METRICS="${NUM_EXTRA_METRICS:-0}" # optional synthetic filler load; 0 keeps blocks lean
-NUM_POD_METRICS="${NUM_POD_METRICS:-0}"  # optional per-pod filler
-NUM_CLUSTER_METRICS="${NUM_CLUSTER_METRICS:-0}" # optional cluster-level filler
+NUM_VMS="${NUM_VMS:-50}"                 # VMs per namespace (0 = skip VM metrics)
+NUM_EXTRA_METRICS="${NUM_EXTRA_METRICS:-0}" # optional synthetic filler load
+NUM_WEEKS="${NUM_WEEKS:-26}"             # weekly periods to generate (26 ≈ 180 days)
+OUTPUT_ROOT="${OUTPUT_ROOT:-./new-run}"
+
+if [[ -n "${RS_PROFILE:-}" && "${RS_PROFILE}" != "Max OverAll" && "${RS_PROFILE}" != "P95" && "${RS_PROFILE}" != "P99" ]]; then
+  echo "RS_PROFILE must be one of: Max OverAll, P95, P99" >&2
+  exit 2
+fi
 MIN_GAUGE_MIN="${MIN_GAUGE_MIN:-2.1}"
 MIN_GAUGE_MAX="${MIN_GAUGE_MAX:-4.6}"
 MAX_GAUGE_MIN="${MAX_GAUGE_MIN:-10.6}"
 MAX_GAUGE_MAX="${MAX_GAUGE_MAX:-19.8}"
 
-# Weekly --max-time values: the WEEKS weeks ending at END_EPOCH (default: today
-# 00:00 UTC), oldest first. Keeping the data recent keeps it inside the hub's
-# retention (MCO default 365d); older blocks are deleted by the compactor.
-WEEKS="${WEEKS:-16}"
-END_EPOCH="${END_EPOCH:-$(( ( $(date -u +%s) / 86400 ) * 86400 ))}"
-iso() { date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ; }
+# Compute MAX_TIMES dynamically: NUM_WEEKS weekly dates ending near today.
+# END_DATE defaults to today; override to pin the newest week boundary.
+END_DATE="${END_DATE:-$(date +%Y-%m-%d)}"
 MAX_TIMES=()
-for (( w = WEEKS - 1; w >= 0; w-- )); do MAX_TIMES+=("$(iso $(( END_EPOCH - w * 7 * 86400 )))"); done
+for ((w = NUM_WEEKS - 1; w >= 0; w--)); do
+  days_back=$((w * 7))
+  if date -v-1d >/dev/null 2>&1; then
+    # macOS date
+    MAX_TIMES+=("$(date -j -v-${days_back}d -f "%Y-%m-%d" "$END_DATE" "+%Y-%m-%dT00:00:00Z")")
+  else
+    # GNU/Linux date
+    MAX_TIMES+=("$(date -d "$END_DATE - ${days_back} days" "+%Y-%m-%dT00:00:00Z")")
+  fi
+done
 
 # Function to generate a random number in the given range
 random_in_range() {
@@ -57,7 +72,7 @@ random_in_range() {
 
 # Loop through clusters and weeks to generate blocks
 for ((cluster = start; cluster <= end; cluster++)); do
-    for i in "${!MAX_TIMES[@]}"; do
+    for i in $(seq 0 $((NUM_WEEKS - 1))); do
       PROFILE="custom-continous-1-week-full"
       MAX_TIME=${MAX_TIMES[$i]}
 
@@ -65,7 +80,7 @@ for ((cluster = start; cluster <= end; cluster++)); do
       MAX_GAUGE=$(random_in_range "$MAX_GAUGE_MIN" "$MAX_GAUGE_MAX")
 
       # Output directory based on cluster
-      OUTPUT_DIR="./new-run/cluster-${cluster}"
+      OUTPUT_DIR="$OUTPUT_ROOT/cluster-${cluster}"
 
       mkdir -p "$OUTPUT_DIR"
 
@@ -74,8 +89,7 @@ for ((cluster = start; cluster <= end; cluster++)); do
       # is emitted per-series by the profile (Max OverAll/P95/P99), so it must
       # NOT be passed via --labels here.
       NUM_NAMESPACES=$NUM_NAMESPACES NUM_WORKLOADS=$NUM_WORKLOADS NUM_PODS=$NUM_PODS \
-        NUM_EXTRA_METRICS=$NUM_EXTRA_METRICS NUM_POD_METRICS=$NUM_POD_METRICS NUM_CLUSTER_METRICS=$NUM_CLUSTER_METRICS \
-        MIN_GAUGE=$MIN_GAUGE MAX_GAUGE=$MAX_GAUGE \
+        NUM_VMS=$NUM_VMS NUM_EXTRA_METRICS=$NUM_EXTRA_METRICS MIN_GAUGE=$MIN_GAUGE MAX_GAUGE=$MAX_GAUGE \
         ./thanosbench block plan -p "$PROFILE" \
         --labels "cluster=\"ac-test-man-${cluster}\"" \
         --labels "aggregation=\"1d\"" \
@@ -84,4 +98,4 @@ for ((cluster = start; cluster <= end; cluster++)); do
     done
 done
 
-echo "Block generation completed for clusters $start to $end (namespaces=$NUM_NAMESPACES, workloads=$NUM_WORKLOADS, pods=$NUM_PODS)."
+echo "Block generation completed for clusters $start to $end (namespaces=$NUM_NAMESPACES, workloads=$NUM_WORKLOADS, pods=$NUM_PODS, VMs=$NUM_VMS)."

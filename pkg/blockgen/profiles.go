@@ -3,7 +3,6 @@ package blockgen
 import (
 	"context"
 	"fmt"
-	"hash/fnv"
 	"math/rand" // Import the rand package
 	"os"
 	"sort"
@@ -75,6 +74,19 @@ func scopeFor(metric string) cardScope {
 // each acm_rs*/acm_rs_vm* metric is generated once per profile with a `profile`
 // breakdown label rather than relying on a single block-level --labels value.
 var rsProfiles = []string{"Max OverAll", "P95", "P99"}
+
+// selectedRSProfiles allows callers to generate one profile at a time. When
+// RS_PROFILE is unset, preserve the default output containing all profiles.
+func selectedRSProfiles() []string {
+	if profile := strings.TrimSpace(os.Getenv("RS_PROFILE")); profile != "" {
+		for _, candidate := range rsProfiles {
+			if profile == candidate {
+				return []string{profile}
+			}
+		}
+	}
+	return rsProfiles
+}
 
 // recommendationRatio is the headroom the ACM right-sizing rules apply over
 // observed usage (recommendation = usage * 110/100). A *_recommendation series
@@ -153,7 +165,7 @@ func measureSpec(base SeriesSpec, metric string, memMin, memMax float64) SeriesS
 // empty value (no profile label) for everything else.
 func profilesFor(metric string) []string {
 	if isRightSizingMetric(metric) {
-		return rsProfiles
+		return selectedRSProfiles()
 	}
 	return []string{""}
 }
@@ -445,25 +457,6 @@ func getEnvFloat(key string, def float64) (float64, error) {
 	return f, nil
 }
 
-// getEnvDuration mirrors getEnvInt for duration-valued environment variables
-// (e.g. RS_SCRAPE_INTERVAL). Unset/empty yields the default; a value that is
-// present but not a Go duration string ("15m", "1h", "24h") or that is not
-// positive is a fatal error rather than a silent fallback.
-func getEnvDuration(key string, def time.Duration) (time.Duration, error) {
-	v := os.Getenv(key)
-	if v == "" {
-		return def, nil
-	}
-	d, err := time.ParseDuration(v)
-	if err != nil {
-		return 0, fmt.Errorf("invalid %s=%q: must be a duration such as 15m, 1h or 24h: %w", key, v, err)
-	}
-	if d <= 0 {
-		return 0, fmt.Errorf("invalid %s=%q: must be > 0", key, v)
-	}
-	return d, nil
-}
-
 func realisticK8s(ranges []time.Duration, rolloutInterval time.Duration, apps int, metricsPerApp int) PlanFn {
 	return func(ctx context.Context, maxTime model.TimeOrDurationValue, extLset labels.Labels, blockEncoder func(BlockSpec) error) error {
 
@@ -599,7 +592,7 @@ func custom_continuous(ranges []time.Duration, apps int, metrics []string) PlanF
 		// metrics carry only `namespace`, and everything else keeps the flat
 		// namespace x name shape. acm_rs*/acm_rs_vm* metrics are additionally
 		// emitted once per right-sizing profile (Max OverAll/P95/P99), so their
-		// per-scope count is multiplied by len(rsProfiles). Project the per-block
+		// per-scope count is multiplied by the selected profile count. Project the per-block
 		// series count up front and refuse a run that would blow past the
 		// in-memory block cap.
 		projected := 0
@@ -616,7 +609,7 @@ func custom_continuous(ranges []time.Duration, apps int, metrics []string) PlanF
 			projected += base * len(profilesFor(m))
 		}
 		fmt.Fprintf(os.Stderr, "custom_continuous: %d core + %d filler metric(s), %d namespaces x %d names x %d profiles -> %d series/block\n",
-			len(metrics), numExtra, numNamespaces, numNames, len(rsProfiles), projected)
+			len(metrics), numExtra, numNamespaces, numNames, len(selectedRSProfiles()), projected)
 		if projected > maxSeriesPerBlock {
 			return fmt.Errorf("projected %d series/block exceeds cap %d: lower NUM_NAMESPACES/NUM_NAMES/NUM_EXTRA_METRICS", projected, maxSeriesPerBlock)
 		}
@@ -751,9 +744,6 @@ var rsMeasures = []string{
 	"memory_request", "memory_usage", "memory_recommendation",
 }
 
-// rsHardMeasures are the ResourceQuota ceilings emitted at the namespace level only.
-var rsHardMeasures = []string{"cpu_request_hard", "memory_request_hard"}
-
 // rightSizingLeveled generates ACM right-sizing gauges across four aggregation
 // levels — cluster, namespace, workload and pod — each carrying the per-level
 // breakdown labels the acm_rs recording rules / dashboards expect:
@@ -782,23 +772,8 @@ var rsHardMeasures = []string{"cpu_request_hard", "memory_request_hard"}
 //	workload:  NUM_NAMESPACES * NUM_WORKLOADS
 //	pod:       NUM_NAMESPACES * NUM_WORKLOADS * NUM_PODS
 //
-// Pod names are unique across namespaces and clusters and shaped like Deployment
-// pods (see podName), so the pod label has one distinct value per pod. Pods
-// don't churn: the same pods exist for the whole generated time range.
-//
-// Every acm_rs series is sampled every RS_SCRAPE_INTERVAL (default 15m; 24h
-// matches the daily recording rules). seriesgen places a block's samples at
-// mint + k*interval for k >= 1, so a block shorter than the interval still
-// holds one sample per series, but that sample lands one interval after the
-// block's planned start, i.e. past its planned end (see RIGHT_SIZING.md).
-//
-// Optional filler (off by default for this profile) stands in for the other
-// metrics a managed cluster sends, all sampled every 5m regardless of
-// RS_SCRAPE_INTERVAL:
-//
-//	NUM_EXTRA_METRICS    extra_metric_N{namespace}                     one series per namespace
-//	NUM_POD_METRICS      extra_pod_metric_N{container,namespace,pod}   one series per pod
-//	NUM_CLUSTER_METRICS  extra_cluster_metric_N                        one series per cluster
+// An optional NUM_EXTRA_METRICS filler load (off by default for this profile) can
+// be layered on for cardinality/load testing.
 func rightSizingLeveled(ranges []time.Duration) PlanFn {
 	return func(ctx context.Context, maxTime model.TimeOrDurationValue, extLset labels.Labels, blockEncoder func(BlockSpec) error) error {
 
@@ -836,64 +811,34 @@ func rightSizingLeveled(ranges []time.Duration) PlanFn {
 		if err != nil {
 			return err
 		}
-		numPodMetrics, err := getEnvInt("NUM_POD_METRICS", 0)
+		numVMs, err := getEnvInt("NUM_VMS", 0)
 		if err != nil {
 			return err
-		}
-		numClusterMetrics, err := getEnvInt("NUM_CLUSTER_METRICS", 0)
-		if err != nil {
-			return err
-		}
-		// RS_SCRAPE_INTERVAL is the sample interval of the acm_rs:* series. The ACM
-		// right-sizing recording rules evaluate once a day, so 24h is the realistic
-		// cadence; the 15m default is kept so existing runs are unchanged. The
-		// filler keeps its own 5m interval regardless.
-		rsScrapeInterval, err := getEnvDuration("RS_SCRAPE_INTERVAL", 15*time.Minute)
-		if err != nil {
-			return err
-		}
-		// The generator writes a series' samples at mint+interval, mint+2*interval,
-		// ... up to the first multiple of the interval that reaches the block's
-		// maxt. When the interval divides the block length that overshoot is 1 ms;
-		// otherwise the last sample lands up to one interval past maxt, inside the
-		// next block's time range, and (as the 5m filler starts the next block
-		// earlier) the blocks overlap and the compactor halts. Verified with
-		// 45m and 1h30m. Refuse such intervals instead of producing bad data.
-		for _, r := range ranges {
-			if r%rsScrapeInterval != 0 {
-				return fmt.Errorf("RS_SCRAPE_INTERVAL=%s must divide every block length of the profile (%v), e.g. 15m, 30m, 1h or 2h: otherwise a block's last sample lands past its end, blocks overlap and the compactor halts", rsScrapeInterval, ranges)
-			}
 		}
 
 		// namespace level additionally carries the ResourceQuota "hard limit"
 		// gauges (cpu/memory request_hard) the namespaces dashboard queries.
-		rsNamespaceMeasures := append(append([]string{}, rsMeasures...), rsHardMeasures...)
+		rsNamespaceMeasures := append(append([]string{}, rsMeasures...),
+			"cpu_request_hard", "memory_request_hard")
 
-		projected, fits := leveledSeriesPerBlock(numNamespaces, numWorkloads, numPods, numExtra, numPodMetrics, numClusterMetrics)
-		count := ">" + strconv.Itoa(maxSeriesPerBlock)
-		if projected >= 0 {
-			count = strconv.Itoa(projected)
+		perMeasure := 1 + numNamespaces + numNamespaces*numWorkloads + numNamespaces*numWorkloads*numPods
+		// request_hard exists at the namespace level only.
+		namespaceHard := numNamespaces * (len(rsNamespaceMeasures) - len(rsMeasures))
+		// VM series (acm_rs_vm:*) when NUM_VMS > 0: cluster + namespace×VMs
+		// measures, each × profiles, plus kubevirt (no profile).
+		vmProjected := 0
+		if numVMs > 0 {
+			vmCluster := len(rsMeasures)
+			vmNamespace := numNamespaces * numVMs * len(rsMeasures)
+			vmProjected = len(selectedRSProfiles())*(vmCluster+vmNamespace) + numNamespaces*numVMs
 		}
-		fmt.Fprintf(os.Stderr, "rightSizingLeveled: %d namespaces x %d workloads x %d pods x %d profiles (+%d namespace filler, +%d pod filler, +%d cluster filler) = %s series/block, acm_rs sample interval %s\n",
-			numNamespaces, numWorkloads, numPods, len(rsProfiles), numExtra, numPodMetrics, numClusterMetrics, count, rsScrapeInterval)
-		if !fits {
-			return fmt.Errorf("projected %s series/block exceeds cap %d: lower NUM_NAMESPACES/NUM_WORKLOADS/NUM_PODS/NUM_EXTRA_METRICS/NUM_POD_METRICS/NUM_CLUSTER_METRICS", count, maxSeriesPerBlock)
+		// acm_rs series are emitted once per profile; filler is not.
+		projected := len(selectedRSProfiles())*(len(rsMeasures)*perMeasure+namespaceHard) + numExtra*numNamespaces + vmProjected
+		fmt.Fprintf(os.Stderr, "rightSizingLeveled: %d namespaces x %d workloads x %d pods x %d VMs x %d profiles (+%d filler) = %d series/block\n",
+			numNamespaces, numWorkloads, numPods, numVMs, len(selectedRSProfiles()), numExtra, projected)
+		if projected > maxSeriesPerBlock {
+			return fmt.Errorf("projected %d series/block exceeds cap %d: lower NUM_NAMESPACES/NUM_WORKLOADS/NUM_PODS/NUM_VMS/NUM_EXTRA_METRICS", projected, maxSeriesPerBlock)
 		}
-
-		// Pod names are computed once (after the cap check) so the acm_rs:pod
-		// series and the per-pod filler share them, and every block of the plan
-		// uses the same names. The cluster block label makes them unique across
-		// clusters too.
-		cluster := extLset.Get("cluster")
-		podNames := make([]string, 0, numNamespaces*numWorkloads*numPods)
-		for ni := 0; ni < numNamespaces; ni++ {
-			for wi := 0; wi < numWorkloads; wi++ {
-				for pi := 0; pi < numPods; pi++ {
-					podNames = append(podNames, podName(cluster, fmt.Sprintf("namespace-%d", ni), fmt.Sprintf("workload-%d", wi), pi))
-				}
-			}
-		}
-		podAt := func(ni, wi, pi int) string { return podNames[(ni*numWorkloads+wi)*numPods+pi] }
 
 		randomJitter := rand.Intn(10) + 1
 		maxt := rangeForTimestamp(maxTime.PrometheusTimestamp(), durToMilis(2*time.Hour))
@@ -905,7 +850,7 @@ func rightSizingLeveled(ranges []time.Duration) PlanFn {
 				Max:            maxGauge,
 				Min:            minGauge,
 				Jitter:         float64(randomJitter),
-				ScrapeInterval: rsScrapeInterval,
+				ScrapeInterval: 15 * time.Minute,
 				ChangeInterval: 10 * time.Minute,
 			},
 		}
@@ -954,7 +899,7 @@ func rightSizingLeveled(ranges []time.Duration) PlanFn {
 				add(name, append(breakdown, labels.Label{Name: "profile", Value: profile}), measureSpec(coreSpec, name, memMin, memMax))
 			}
 
-			for _, profile := range rsProfiles {
+			for _, profile := range selectedRSProfiles() {
 				for _, m := range rsMeasures {
 					// cluster level: one series per profile; cluster identity comes
 					// from the block labels.
@@ -985,7 +930,7 @@ func rightSizingLeveled(ranges []time.Duration) PlanFn {
 						}
 
 						for pi := 0; pi < numPods; pi++ {
-							pod := podAt(ni, wi, pi)
+							pod := fmt.Sprintf("%s-%d", wl, pi)
 
 							for _, m := range rsMeasures {
 								// pod level (nested under its workload)
@@ -1012,34 +957,40 @@ func rightSizingLeveled(ranges []time.Duration) PlanFn {
 				}
 			}
 
-			// Optional per-pod filler (NUM_POD_METRICS), one series per pod per
-			// metric, on the same pods as the acm_rs:pod series. Real clusters send
-			// most of their other series per pod/container (kube_pod_*, container_*),
-			// so this reproduces that index shape — many distinct pod values — and
-			// not just the series count.
-			for e := 1; e <= numPodMetrics; e++ {
-				name := fmt.Sprintf("extra_pod_metric_%d", e)
-				for ni := 0; ni < numNamespaces; ni++ {
-					ns := fmt.Sprintf("namespace-%d", ni)
-					for wi := 0; wi < numWorkloads; wi++ {
-						for pi := 0; pi < numPods; pi++ {
-							add(name, labels.Labels{
-								{Name: "container", Value: "app"},
-								{Name: "namespace", Value: ns},
-								{Name: "pod", Value: podAt(ni, wi, pi)},
-							}, extraSpec)
+			// VM right-sizing metrics (acm_rs_vm:*) when NUM_VMS > 0.
+			// Emits cluster and namespace-level VM gauges with a per-VM
+			// `name` breakdown, plus the kubevirt status metric.
+			if numVMs > 0 {
+				for _, profile := range selectedRSProfiles() {
+					// VM cluster level
+					for _, m := range rsMeasures {
+						addRS("acm_rs_vm:cluster:"+m, nil, profile)
+					}
+					// VM namespace level (namespace × VM name)
+					for ni := 0; ni < numNamespaces; ni++ {
+						ns := fmt.Sprintf("namespace-%d", ni)
+						for vi := 0; vi < numVMs; vi++ {
+							vmName := fmt.Sprintf("vm-%d", vi)
+							for _, m := range rsMeasures {
+								addRS("acm_rs_vm:namespace:"+m, labels.Labels{
+									{Name: "name", Value: vmName},
+									{Name: "namespace", Value: ns},
+								}, profile)
+							}
 						}
 					}
 				}
-			}
-
-			// Optional cluster-level filler (NUM_CLUSTER_METRICS), one series per
-			// metric; cluster identity comes from the block labels. Most allowlisted
-			// metric names are cluster/node-level and add only one or a few series
-			// each, so this reproduces a real cluster's metric-name count without
-			// adding meaningful load.
-			for e := 1; e <= numClusterMetrics; e++ {
-				add(fmt.Sprintf("extra_cluster_metric_%d", e), nil, extraSpec)
+				// kubevirt_vm_running_status (no profile label)
+				for ni := 0; ni < numNamespaces; ni++ {
+					ns := fmt.Sprintf("namespace-%d", ni)
+					for vi := 0; vi < numVMs; vi++ {
+						vmName := fmt.Sprintf("vm-%d", vi)
+						add("kubevirt_vm_running_status_last_transition_timestamp_seconds", labels.Labels{
+							{Name: "name", Value: vmName},
+							{Name: "namespace", Value: ns},
+						}, coreSpec)
+					}
+				}
 			}
 
 			if err := blockEncoder(b); err != nil {
@@ -1079,44 +1030,6 @@ var workloadTypes = []string{"deployment", "statefulset", "daemonset"}
 
 func workloadTypeFor(index int) string {
 	return workloadTypes[index%len(workloadTypes)]
-}
-
-// podName returns the name of pod pi of workload wl in namespace ns of the given
-// cluster, shaped like a Deployment pod: <workload>-<10-hex pod-template
-// hash>-<ordinal>. The hash comes from cluster/ns/wl, so names don't repeat
-// across namespaces or clusters (as in a real fleet), and it is deterministic,
-// so a pod keeps its name in every block and every run. Pods never churn.
-func podName(cluster, ns, wl string, pi int) string {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(cluster + "/" + ns + "/" + wl))
-	return fmt.Sprintf("%s-%010x-%d", wl, h.Sum64()>>24, pi)
-}
-
-// leveledSeriesPerBlock returns how many series rightSizingLeveled emits per
-// block and whether that fits maxSeriesPerBlock. Each product is bounded before
-// it is formed, so absurd inputs report "doesn't fit" (with -1) instead of
-// overflowing past the cap.
-func leveledSeriesPerBlock(numNamespaces, numWorkloads, numPods, numExtra, numPodMetrics, numClusterMetrics int) (int, bool) {
-	nsWl, ok1 := boundedMul(maxSeriesPerBlock, numNamespaces, numWorkloads)
-	pods, ok2 := boundedMul(maxSeriesPerBlock, nsWl, numPods)
-	podFiller, ok3 := boundedMul(maxSeriesPerBlock, numPodMetrics, pods)
-	nsFiller, ok4 := boundedMul(maxSeriesPerBlock, numExtra, numNamespaces)
-	// Each of these alone already means more series than the cap.
-	if !ok1 || !ok2 || !ok3 || !ok4 || numNamespaces > maxSeriesPerBlock || numClusterMetrics > maxSeriesPerBlock {
-		return -1, false
-	}
-	// acm_rs series are emitted once per profile; request_hard exists at the
-	// namespace level only; filler has no profile label.
-	n := len(rsProfiles)*(len(rsMeasures)*(1+numNamespaces+nsWl+pods)+len(rsHardMeasures)*numNamespaces) + nsFiller + podFiller + numClusterMetrics
-	return n, n <= maxSeriesPerBlock
-}
-
-// boundedMul returns a*b for non-negative a and b, or false if it exceeds limit.
-func boundedMul(limit, a, b int) (int, bool) {
-	if a != 0 && b > limit/a {
-		return 0, false
-	}
-	return a * b, true
 }
 
 // rsDimensionSets returns one label set per series for a right-sizing metric.
