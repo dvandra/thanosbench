@@ -95,6 +95,12 @@ func selectedRSProfiles() []string {
 // ValueScale).
 const recommendationRatio = 1.10
 
+// limitRatio is the headroom between request and limit. Kubernetes resource
+// limits are typically set above requests; a 1.5× multiplier places the limit
+// at 150% of the corresponding request, giving dashboards a visible gap
+// between the two while keeping the relationship realistic.
+const limitRatio = 1.50
+
 // defaultMemMin / defaultMemMax are the byte-scale gauge bounds used for memory_*
 // measures when MEM_MIN_GAUGE / MEM_MAX_GAUGE are unset. ACM memory right-sizing
 // metrics are reported in bytes, so a cores-scale range (MIN_GAUGE/MAX_GAUGE,
@@ -135,6 +141,17 @@ func usageSibling(metric string) (string, bool) {
 	return "", false
 }
 
+// requestSibling maps a *_limit metric to its *_request counterpart so the
+// limit series can derive from the request series' value stream (limit =
+// request × limitRatio). Returns false for non-limit metrics.
+func requestSibling(metric string) (string, bool) {
+	const suffix = "_limit"
+	if strings.HasSuffix(metric, suffix) {
+		return strings.TrimSuffix(metric, suffix) + "_request", true
+	}
+	return "", false
+}
+
 // measureSpec returns a copy of base configured for the given fully-qualified
 // metric name:
 //   - memory_* measures are rescaled to the byte-scale range [memMin, memMax]
@@ -156,6 +173,10 @@ func measureSpec(base SeriesSpec, metric string, memMin, memMax float64) SeriesS
 	if sib, ok := usageSibling(metric); ok {
 		base.SeedName = sib
 		base.ValueScale = recommendationRatio
+	}
+	if sib, ok := requestSibling(metric); ok {
+		base.SeedName = sib
+		base.ValueScale = limitRatio
 	}
 	return base
 }
@@ -363,15 +384,20 @@ var (
 			"acm_rs:cluster:cpu_request", "acm_rs:cluster:cpu_usage",
 			"acm_rs:cluster:memory_request", "acm_rs:cluster:memory_usage",
 			"acm_rs:cluster:cpu_recommendation", "acm_rs:cluster:memory_recommendation",
+			"acm_rs:cluster:cpu_limit", "acm_rs:cluster:memory_limit",
 			"acm_rs:namespace:cpu_request", "acm_rs:namespace:cpu_usage",
 			"acm_rs:namespace:memory_request", "acm_rs:namespace:memory_usage",
 			"acm_rs:namespace:cpu_recommendation", "acm_rs:namespace:memory_recommendation",
+			"acm_rs:namespace:cpu_limit", "acm_rs:namespace:memory_limit",
 			"acm_rs:workload:cpu_request", "acm_rs:workload:cpu_usage",
 			"acm_rs:workload:memory_request", "acm_rs:workload:memory_usage",
 			"acm_rs:workload:cpu_recommendation", "acm_rs:workload:memory_recommendation",
+			"acm_rs:workload:cpu_limit", "acm_rs:workload:memory_limit",
 			"acm_rs:pod:cpu_request", "acm_rs:pod:cpu_usage",
 			"acm_rs:pod:memory_request", "acm_rs:pod:memory_usage",
 			"acm_rs:pod:cpu_recommendation", "acm_rs:pod:memory_recommendation",
+			"acm_rs:pod:cpu_limit", "acm_rs:pod:memory_limit",
+			"acm_rs:pod:info",
 		}),
 
 		// custom-continous-1-week-full adds two aggregation levels (workload and
@@ -455,6 +481,25 @@ func getEnvFloat(key string, def float64) (float64, error) {
 		return 0, fmt.Errorf("invalid %s=%q: must be a number: %w", key, v, err)
 	}
 	return f, nil
+}
+
+// getEnvDuration mirrors getEnvInt for duration-valued environment variables
+// (e.g. RS_SCRAPE_INTERVAL). Unset/empty yields the default; a value that is
+// present but not a Go duration string ("15m", "1h", "24h") or that is not
+// positive is a fatal error rather than a silent fallback.
+func getEnvDuration(key string, def time.Duration) (time.Duration, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s=%q: must be a duration such as 15m, 1h or 24h: %w", key, v, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("invalid %s=%q: must be > 0", key, v)
+	}
+	return d, nil
 }
 
 func realisticK8s(ranges []time.Duration, rolloutInterval time.Duration, apps int, metricsPerApp int) PlanFn {
@@ -738,10 +783,13 @@ func custom_continuous(ranges []time.Duration, apps int, metrics []string) PlanF
 // kubernetes-mixin `workload_type` convention).
 var rsWorkloadTypes = []string{"Deployment", "StatefulSet", "DaemonSet", "ReplicaSet"}
 
-// rsMeasures are the six right-sizing gauges emitted at every aggregation level.
+// rsMeasures are the right-sizing gauges emitted at every aggregation level.
+// cpu_limit / memory_limit are derived from their _request siblings (scaled by
+// limitRatio) so limits are realistically above requests. The dashboards
+// (workload-overview, workload-detail, pod-overview, pod-detail) query these.
 var rsMeasures = []string{
-	"cpu_request", "cpu_usage", "cpu_recommendation",
-	"memory_request", "memory_usage", "memory_recommendation",
+	"cpu_request", "cpu_usage", "cpu_recommendation", "cpu_limit",
+	"memory_request", "memory_usage", "memory_recommendation", "memory_limit",
 }
 
 // rightSizingLeveled generates ACM right-sizing gauges across four aggregation
@@ -816,6 +864,25 @@ func rightSizingLeveled(ranges []time.Duration) PlanFn {
 			return err
 		}
 
+		// RS_SCRAPE_INTERVAL controls the sample interval of acm_rs:* series.
+		// The ACM right-sizing recording rules evaluate once per day, so 24h is
+		// the realistic cadence; the 15m default preserves existing behaviour.
+		// Using RS_SCRAPE_INTERVAL=1h or 24h generates far fewer samples →
+		// dramatically faster block generation and smaller blocks.
+		rsScrapeInterval, err := getEnvDuration("RS_SCRAPE_INTERVAL", 15*time.Minute)
+		if err != nil {
+			return err
+		}
+		// The generator writes samples at mint+interval, mint+2*interval, ...
+		// When the interval doesn't divide the block length the last sample can
+		// land past maxt inside the next block's range, causing overlaps that
+		// make the compactor halt. Refuse such intervals early.
+		for _, r := range ranges {
+			if r%rsScrapeInterval != 0 {
+				return fmt.Errorf("RS_SCRAPE_INTERVAL=%s must divide every block length of the profile (%v), e.g. 15m, 30m, 1h or 2h: otherwise a block's last sample lands past its end, blocks overlap and the compactor halts", rsScrapeInterval, ranges)
+			}
+		}
+
 		// namespace level additionally carries the ResourceQuota "hard limit"
 		// gauges (cpu/memory request_hard) the namespaces dashboard queries.
 		rsNamespaceMeasures := append(append([]string{}, rsMeasures...),
@@ -824,6 +891,8 @@ func rightSizingLeveled(ranges []time.Duration) PlanFn {
 		perMeasure := 1 + numNamespaces + numNamespaces*numWorkloads + numNamespaces*numWorkloads*numPods
 		// request_hard exists at the namespace level only.
 		namespaceHard := numNamespaces * (len(rsNamespaceMeasures) - len(rsMeasures))
+		// acm_rs:pod:info is emitted once per pod per profile (metadata metric).
+		podInfoSeries := numNamespaces * numWorkloads * numPods
 		// VM series (acm_rs_vm:*) when NUM_VMS > 0: cluster + namespace×VMs
 		// measures, each × profiles, plus kubevirt (no profile).
 		vmProjected := 0
@@ -833,9 +902,10 @@ func rightSizingLeveled(ranges []time.Duration) PlanFn {
 			vmProjected = len(selectedRSProfiles())*(vmCluster+vmNamespace) + numNamespaces*numVMs
 		}
 		// acm_rs series are emitted once per profile; filler is not.
-		projected := len(selectedRSProfiles())*(len(rsMeasures)*perMeasure+namespaceHard) + numExtra*numNamespaces + vmProjected
-		fmt.Fprintf(os.Stderr, "rightSizingLeveled: %d namespaces x %d workloads x %d pods x %d VMs x %d profiles (+%d filler) = %d series/block\n",
-			numNamespaces, numWorkloads, numPods, numVMs, len(selectedRSProfiles()), numExtra, projected)
+		// The +podInfoSeries accounts for the acm_rs:pod:info metadata metric.
+		projected := len(selectedRSProfiles())*(len(rsMeasures)*perMeasure+namespaceHard+podInfoSeries) + numExtra*numNamespaces + vmProjected
+		fmt.Fprintf(os.Stderr, "rightSizingLeveled: %d namespaces x %d workloads x %d pods x %d VMs x %d profiles (+%d filler, +info) = %d series/block, acm_rs sample interval %s\n",
+			numNamespaces, numWorkloads, numPods, numVMs, len(selectedRSProfiles()), numExtra, projected, rsScrapeInterval)
 		if projected > maxSeriesPerBlock {
 			return fmt.Errorf("projected %d series/block exceeds cap %d: lower NUM_NAMESPACES/NUM_WORKLOADS/NUM_PODS/NUM_VMS/NUM_EXTRA_METRICS", projected, maxSeriesPerBlock)
 		}
@@ -850,7 +920,7 @@ func rightSizingLeveled(ranges []time.Duration) PlanFn {
 				Max:            maxGauge,
 				Min:            minGauge,
 				Jitter:         float64(randomJitter),
-				ScrapeInterval: 15 * time.Minute,
+				ScrapeInterval: rsScrapeInterval,
 				ChangeInterval: 10 * time.Minute,
 			},
 		}
@@ -941,6 +1011,21 @@ func rightSizingLeveled(ranges []time.Duration) PlanFn {
 									{Name: "workload_type", Value: wt},
 								}, profile)
 							}
+
+							// acm_rs:pod:info — a metadata metric
+							// (constant value 1) the pod dashboards use
+							// for label joins and pod inventory queries.
+							infoSpec := coreSpec
+							infoSpec.Characteristics.Min = 1
+							infoSpec.Characteristics.Max = 1
+							infoSpec.Characteristics.Jitter = 0
+							add("acm_rs:pod:info", labels.Labels{
+								{Name: "namespace", Value: ns},
+								{Name: "pod", Value: pod},
+								{Name: "profile", Value: profile},
+								{Name: "workload", Value: wl},
+								{Name: "workload_type", Value: wt},
+							}, infoSpec)
 						}
 					}
 				}
