@@ -53,7 +53,7 @@ ABORT: EXPECTED_SERVER_SUBSTR is empty
 
 | Script | Role | Key env vars |
 |---|---|---|
-| `generate_and_publish.sh` | Generate one cluster-week at a time and upload to the immutable master while the next generates; resumable; writes `manifest.json` last. Leave `HUB_PREFIX` unset for master production. | `CLUSTERS`, `WEEKS`, `NUM_*`, `BUCKET`, `SHARED_PREFIX`, `AWS_PROFILE_NAME`, `MAX_INFLIGHT`, `WORK`, `DRY_RUN` |
+| `generate_and_publish.sh` | Generate one cluster-week at a time and upload to the immutable master while the next generates; resumable; writes `manifest.json` last. Leave `HUB_PREFIX` unset for master production. | `CLUSTERS`, `WEEKS`, `NUM_*`, `BUCKET`, `SHARED_PREFIX`, `PER_CLUSTER_PREFIX`, `AWS_PROFILE_NAME`, `MAX_INFLIGHT`, `UPLOAD_BLOCK_PARALLEL`, `UPLOAD_RETRY_*`, `WORK`, `DRY_RUN` |
 | `copy_master_to_hub.sh` | Copy a completed master to an empty hub-owned S3 prefix, block data first and all `meta.json` files last; exact-ULID verification and safe resume | `BUCKET`, `MASTER_PREFIX`, `DEST_BUCKET`, `HUB_PREFIX`, `AWS_PROFILE_NAME`, `RESUME` |
 | `configure_hub_s3.sh` | Point the hub's `thanos-object-storage` Secret at `s3://BUCKET/PREFIX` and restart the Thanos pods; `rollback` restores the backup | `EXPECTED_SERVER_SUBSTR`, `BUCKET`, `PREFIX`, `REGION`, `AWS_PROFILE_NAME` |
 | `preflight_180day.sh` | READ-ONLY go/no-go checks (retention, compactor; capacity only for MinIO) | `MIN_RETENTION_DAYS` (182) |
@@ -92,7 +92,7 @@ GEN_ENV=(CLUSTERS="$(seq -f 'ac-test-man-%g' 1 20 | tr '\n' ' ')"
 env "${GEN_ENV[@]}" WEEKS=26 SHARED_PREFIX=rs-perf-shared/20c-180d-2026-09-29 DRY_RUN=1 bash generate_and_publish.sh
 #    Trial (20 clusters × 2 weeks; ~1h):
 env "${GEN_ENV[@]}" WEEKS=2  SHARED_PREFIX=rs-perf-shared/20c-14d-2026-09-29 WORK=./gen-work-trial bash generate_and_publish.sh
-#    Full 180 days (20 clusters × 26 weeks; ~15h from a laptop, upload-bound; ~0.5 TB uploaded):
+#    Full 180 days (20 clusters × 26 weeks; ~13h, generation-bound; ~0.5 TB uploaded):
 env "${GEN_ENV[@]}" WEEKS=26 SHARED_PREFIX=rs-perf-shared/20c-180d-2026-09-29 WORK=./gen-work-180d bash generate_and_publish.sh
 
 # 3. COPY THE CERTIFIED MASTER INTO AN EMPTY, HUB-OWNED PREFIX. Copy every block's data
@@ -147,14 +147,21 @@ Same settings with `CLUSTERS` set to 100 or 300 names. Plan for (recommended fil
 | Blocks | 4,680 | 23,400 | 70,200 |
 | Upload (raw) | ~0.5 TB | ~2.4 TB | ~7.2 TB |
 | On the hub after downsampling | ~3 TB | ~15 TB | ~45 TB |
-| Generation time (one machine) | ~13h (~15h from a laptop, upload-bound) | ~65h | ~195h |
+| Generation time (one machine) | ~13h | ~65h | ~195h |
 
-- Local disk is no longer the limit (~3 GB at any time); upload bandwidth is. From a
-  laptop (~10 MB/s measured) the upload is slightly slower than generation, so category 1
-  takes ~15h instead of ~13h; `MAX_INFLIGHT=3` is the right setting (2 costs ~4h more, 6
-  saves under 1h). For categories 2 and 3 run `generate_and_publish.sh` on a machine in the
-  bucket's region (an EC2 instance in us-west-2): in-region the upload is not a factor and
-  generation is the only cost. Ctrl-C stops the run; re-run the same command to resume.
+- Neither local disk (~3 GB at any time) nor upload bandwidth is the limit any more:
+  generation is. A cluster-week's blocks upload in parallel, so the stream count is
+  `MAX_INFLIGHT` × `UPLOAD_BLOCK_PARALLEL` — 9 at the defaults, which outruns generation in
+  all three categories even from a laptop.
+- Tune the stream count, not a single transfer. One stream to us-west-2 measured 3.6 MB/s and
+  barely moved with `max_concurrent_requests=40`; four parallel streams reached 11 MB/s
+  aggregate. Throughput comes from more streams, but the aggregate saturates, so past roughly
+  a dozen there is nothing left to win. For categories 2 and 3 still prefer a machine in the
+  bucket's region (an EC2 instance in us-west-2). Ctrl-C stops the run; re-run the same
+  command to resume.
+- A cluster-week whose upload fails is retried in bounded batches after generation finishes
+  (`UPLOAD_RETRY_ROUNDS`, default 3). Retries re-upload from the local copy and never
+  regenerate, so a transient S3 error no longer costs a second invocation.
 - One dataset must be produced by one `generate_and_publish.sh` run (one machine, one
   `WORK` dir): the script owns its `SHARED_PREFIX` and checks the final block count
   against its own plan. Splitting a dataset across machines is not supported.
