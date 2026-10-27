@@ -12,6 +12,9 @@ new-run-3day/
 gen-180day.manifest.json
 thanos-object-storage.backup.*.yaml
 
+# Sensitive config (contains S3 credentials)
+thanos.yaml
+
 # Go workspace files
 vendor/
 
