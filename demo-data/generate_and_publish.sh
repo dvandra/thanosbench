@@ -53,6 +53,7 @@ esac
 BUCKET="${BUCKET:-}"
 SHARED_PREFIX="${SHARED_PREFIX:-}"                   # e.g. rs-perf-shared/20c-180d-2026-09-28
 HUB_PREFIX="${HUB_PREFIX:-}"                         # optional: the hub's own Thanos prefix (server-side copy)
+PER_CLUSTER_PREFIX="${PER_CLUSTER_PREFIX:-0}"         # 1 = store blocks under SHARED_PREFIX/<cluster>/
 AWS_PROFILE_NAME="${AWS_PROFILE_NAME:-oia-rs}"       # empty -> ambient AWS credentials
 
 BYTES_PER_SAMPLE="${BYTES_PER_SAMPLE:-9.9}"
@@ -100,7 +101,7 @@ HUB_GB=$(python3 -c "print('%.1f'%($CW_BYTES*$TOTAL_CW*(1+$DS_5M_RATIO+$DS_1H_RA
 LOCAL_GB=$(python3 -c "print('%.1f'%($CW_BYTES*($MAX_INFLIGHT+1)/1e9))")
 GEN_H=$(python3 -c "print('%.1f'%($TOTAL_CW*$GEN_SECONDS_PER_CLUSTER_WEEK/3600))")
 
-PARAMS="profile=$PROFILE blocks_per_week=$BLOCKS_PER_WEEK clusters=[$CLUSTERS] N=$NUM_NAMESPACES W=$NUM_WORKLOADS P=$NUM_PODS extra=$NUM_EXTRA_METRICS pod=$NUM_POD_METRICS cluster=$NUM_CLUSTER_METRICS rs_interval=${RS_SCRAPE_INTERVAL:-15m} bucket=$BUCKET shared=$SHARED_PREFIX hub=$HUB_PREFIX"
+PARAMS="profile=$PROFILE blocks_per_week=$BLOCKS_PER_WEEK clusters=[$CLUSTERS] N=$NUM_NAMESPACES W=$NUM_WORKLOADS P=$NUM_PODS extra=$NUM_EXTRA_METRICS pod=$NUM_POD_METRICS cluster=$NUM_CLUSTER_METRICS rs_interval=${RS_SCRAPE_INTERVAL:-15m} bucket=$BUCKET shared=$SHARED_PREFIX hub=$HUB_PREFIX per_cluster=$PER_CLUSTER_PREFIX"
 if [[ -f "$WORK/state/params" && "$(cat "$WORK/state/params")" != "$PARAMS" ]]; then
   echo "ABORT: $WORK was started with different parameters:" >&2; echo "  was: $(cat "$WORK/state/params")" >&2; echo "  now: $PARAMS" >&2
   echo "  Only WEEKS may change between runs; use a new WORK dir (and SHARED_PREFIX) for a different dataset." >&2; exit 1
@@ -117,7 +118,11 @@ echo "  profile:      $PROFILE ($BLOCKS_PER_WEEK blocks/week)"
 echo "  clusters:     $NCL; weeks: $WEEKS (~$(( WEEKS*7 )) days); cluster-weeks: $TOTAL_CW; blocks: $BLOCKS"
 echo "  cardinality:  N=$NUM_NAMESPACES W=$NUM_WORKLOADS P=$NUM_PODS -> $RS_SPB right-sizing + $FILLER_SPB filler = $SPB series/block"
 echo "  window:       $(iso $(( BASE_EPOCH - WEEKS*7*86400 ))) .. $(iso "$BASE_EPOCH") (pinned)"
-echo "  destination:  s3://$BUCKET/$SHARED_PREFIX/${HUB_PREFIX:+  + server-side copy -> s3://$BUCKET/$HUB_PREFIX/}"
+if [[ "$PER_CLUSTER_PREFIX" == "1" ]]; then
+  echo "  destination:  s3://$BUCKET/$SHARED_PREFIX/<cluster>/${HUB_PREFIX:+  + server-side copy -> s3://$BUCKET/$HUB_PREFIX/}"
+else
+  echo "  destination:  s3://$BUCKET/$SHARED_PREFIX/${HUB_PREFIX:+  + server-side copy -> s3://$BUCKET/$HUB_PREFIX/}"
+fi
 echo "  projected:    ~$PROJ_GB GB to upload; ~$HUB_GB GB on the hub after downsampling; peak local disk ~$LOCAL_GB GB (MAX_INFLIGHT=$MAX_INFLIGHT)"
 echo "  time:         ~$GEN_H h of generation at ${GEN_SECONDS_PER_CLUSTER_WEEK}s per cluster-week; uploads overlap with generation"
 python3 -c "import sys; sys.exit(0 if $SPB > 5000000 else 1)" && { echo "ABORT: $SPB series/block > maxSeriesPerBlock=5,000,000." >&2; exit 1; }
@@ -159,6 +164,12 @@ ulids_in() { find "$1" -mindepth 1 -maxdepth 1 -type d -name '[0-9A-Z]*' -exec b
 complete_blocks_in() { local n=0; for u in $(ulids_in "$1"); do [[ -f "$1/$u/meta.json" && -f "$1/$u/index" && -d "$1/$u/chunks" ]] && n=$((n+1)); done; echo "$n"; }
 s3_has_meta() { aws_ s3api head-object --bucket "$BUCKET" --key "$1/$2/meta.json" >/dev/null 2>&1; }
 s3_rm_block() { aws_ s3 rm --only-show-errors --recursive "s3://$BUCKET/$1/$2/" || { echo "ABORT: could not remove s3://$BUCKET/$1/$2/ (a leftover block would duplicate the regenerated one)." >&2; exit 1; }; }
+# shared_prefix_for returns the S3 prefix for a cluster's blocks. When
+# PER_CLUSTER_PREFIX=1 the layout is SHARED_PREFIX/<cluster>/<ULID>/ instead of
+# the flat SHARED_PREFIX/<ULID>/.
+shared_prefix_for() { # $1=cluster
+  if [[ "$PER_CLUSTER_PREFIX" == "1" ]]; then echo "$SHARED_PREFIX/$1"; else echo "$SHARED_PREFIX"; fi
+}
 
 generate_cw() { # $1=cluster $2=week $3=dir
   local cluster="$1" w="$2" dir="$3" maxt gauges
@@ -182,25 +193,27 @@ upload_block() { # $1=dir $2=ulid $3=prefix : data first, meta.json last
   s3cp "$1/$2/meta.json" "s3://$BUCKET/$3/$2/meta.json" || { echo "upload of $2 meta.json failed"; return 1; }
   s3_has_meta "$3" "$2" || { echo "upload of $2 not visible in S3"; return 1; }
 }
-copy_block() { # $1=ulid : shared -> hub, server-side, meta.json last
-  s3cp --recursive "s3://$BUCKET/$SHARED_PREFIX/$1/" "s3://$BUCKET/$HUB_PREFIX/$1/" --exclude meta.json || { echo "copy of $1 data failed"; return 1; }
-  s3cp "s3://$BUCKET/$SHARED_PREFIX/$1/meta.json" "s3://$BUCKET/$HUB_PREFIX/$1/meta.json" || { echo "copy of $1 meta.json failed"; return 1; }
+copy_block() { # $1=ulid $2=source_prefix : source -> hub, server-side, meta.json last
+  s3cp --recursive "s3://$BUCKET/$2/$1/" "s3://$BUCKET/$HUB_PREFIX/$1/" --exclude meta.json || { echo "copy of $1 data failed"; return 1; }
+  s3cp "s3://$BUCKET/$2/$1/meta.json" "s3://$BUCKET/$HUB_PREFIX/$1/meta.json" || { echo "copy of $1 meta.json failed"; return 1; }
   s3_has_meta "$HUB_PREFIX" "$1" || { echo "copy of $1 not visible in S3"; return 1; }
 }
-copy_cw_to_hub() { # $1=ulids file : copy the blocks not yet in HUB_PREFIX (same ULIDs, idempotent)
-  local u
+copy_cw_to_hub() { # $1=cluster $2=ulids file : copy the blocks not yet in HUB_PREFIX (same ULIDs, idempotent)
+  local u pfx
+  pfx="$(shared_prefix_for "$1")"
   while read -r u; do
-    s3_has_meta "$HUB_PREFIX" "$u" || copy_block "$u" || return 1
-  done < "$1"
+    s3_has_meta "$HUB_PREFIX" "$u" || copy_block "$u" "$pfx" || return 1
+  done < "$2"
 }
 publish_body() { # $1=cluster $2=week $3=dir
-  local u
+  local u pfx
+  pfx="$(shared_prefix_for "$1")"
   # 1. the whole cluster-week into the shared prefix first ...
-  while read -r u; do upload_block "$3" "$u" "$SHARED_PREFIX" || return 1; done < "$WORK/state/$1.w$2.ulids"
+  while read -r u; do upload_block "$3" "$u" "$pfx" || return 1; done < "$WORK/state/$1.w$2.ulids"
   # 2. ... then into the hub prefix. Nothing reaches the hub (and its compactor)
   #    before the shared copy is complete, so a resume never has to regenerate a
   #    cluster-week the hub has already seen (see the resume step).
-  if [[ -n "$HUB_PREFIX" ]]; then copy_cw_to_hub "$WORK/state/$1.w$2.ulids" || return 1; fi
+  if [[ -n "$HUB_PREFIX" ]]; then copy_cw_to_hub "$1" "$WORK/state/$1.w$2.ulids" || return 1; fi
   mv "$WORK/state/$1.w$2.ulids" "$WORK/state/$1.w$2.done" || return 1
   rm -rf "$3"
   echo "done"
@@ -236,23 +249,24 @@ done
 for f in "$WORK"/state/*.ulids; do
   [[ -e "$f" ]] || continue
   b="$(basename "$f" .ulids)"; cluster="${b%.w*}"; w="${b##*.w}"; dir="$WORK/tmp/$cluster-w$w"
+  pfx="$(shared_prefix_for "$cluster")"
   present=0
-  while read -r u; do s3_has_meta "$SHARED_PREFIX" "$u" && present=$((present+1)); done < "$f"
+  while read -r u; do s3_has_meta "$pfx" "$u" && present=$((present+1)); done < "$f"
   if [[ "$present" -eq "$BLOCKS_PER_WEEK" ]]; then
     # shared copy complete: only the hub copy may be missing or partial. Finish it
     # with the SAME ULIDs (server-side); never regenerate what the hub may have seen.
     log "resume: $cluster week $w complete in the shared prefix, finishing the hub copy"
-    if [[ -n "$HUB_PREFIX" ]]; then copy_cw_to_hub "$f" || { echo "ABORT: could not finish the hub copy of $cluster week $w" >&2; exit 1; }; fi
+    if [[ -n "$HUB_PREFIX" ]]; then copy_cw_to_hub "$cluster" "$f" || { echo "ABORT: could not finish the hub copy of $cluster week $w" >&2; exit 1; }; fi
     mv "$f" "$WORK/state/$b.done"; rm -rf "$dir"
   elif [[ -d "$dir" && "$(complete_blocks_in "$dir")" -eq "$BLOCKS_PER_WEEK" ]]; then
     log "resume: $cluster week $w generated locally, re-uploading its $present partial block(s) and the rest"
-    while read -r u; do s3_rm_block "$SHARED_PREFIX" "$u"; done < "$f"
+    while read -r u; do s3_rm_block "$pfx" "$u"; done < "$f"
     publish_cw "$cluster" "$w" "$dir" &
   else
     # shared copy incomplete and no local copy: nothing of it reached the hub
     # prefix (the hub copy starts only after the shared copy is complete)
     log "resume: $cluster week $w incomplete, removing its $present uploaded block(s) and regenerating"
-    while read -r u; do s3_rm_block "$SHARED_PREFIX" "$u"; done < "$f"
+    while read -r u; do s3_rm_block "$pfx" "$u"; done < "$f"
     rm -f "$f"; rm -rf "$dir"
   fi
 done
