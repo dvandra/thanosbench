@@ -76,7 +76,7 @@ export AWS_PROFILE_NAME=oia-rs
 # 1. PREFLIGHT — read-only; must print "GO" (retention >= 182d, compactor healthy)
 !  bash preflight_180day.sh
 
-# 2. GENERATE + PUBLISH THE MASTER — one cluster-week at a time (~60-90 s, ~0.92 GB),
+# 2. GENERATE + PUBLISH THE MASTER — one cluster-week at a time (~60-90 s, ~1.08 GB),
 #    uploaded to the master prefix while the next one generates; ~3 GB of local disk,
 #    resumable (re-run the same command). Needs ~8.2 GB RAM. Do NOT set HUB_PREFIX:
 #    a master-production run never writes into a hub-owned prefix.
@@ -92,7 +92,7 @@ GEN_ENV=(CLUSTERS="$(seq -f 'ac-test-man-%g' 1 20 | tr '\n' ' ')"
 env "${GEN_ENV[@]}" WEEKS=26 SHARED_PREFIX=rs-perf-shared/20c-180d-2026-09-29 DRY_RUN=1 bash generate_and_publish.sh
 #    Trial (20 clusters × 2 weeks; ~1h):
 env "${GEN_ENV[@]}" WEEKS=2  SHARED_PREFIX=rs-perf-shared/20c-14d-2026-09-29 WORK=./gen-work-trial bash generate_and_publish.sh
-#    Full 180 days (20 clusters × 26 weeks; ~13h, generation-bound; ~0.5 TB uploaded):
+#    Full 180 days (20 clusters × 26 weeks; ~15h, upload-bound; ~0.56 TB uploaded):
 env "${GEN_ENV[@]}" WEEKS=26 SHARED_PREFIX=rs-perf-shared/20c-180d-2026-09-29 WORK=./gen-work-180d bash generate_and_publish.sh
 
 # 3. COPY THE CERTIFIED MASTER INTO AN EMPTY, HUB-OWNED PREFIX. Copy every block's data
@@ -145,20 +145,24 @@ Same settings with `CLUSTERS` set to 100 or 300 names. Plan for (recommended fil
 | | 20 clusters | 100 clusters | 300 clusters |
 |---|---|---|---|
 | Blocks | 4,680 | 23,400 | 70,200 |
-| Upload (raw) | ~0.5 TB | ~2.4 TB | ~7.2 TB |
+| Upload (raw) | ~0.56 TB | ~2.8 TB | ~8.4 TB |
 | On the hub after downsampling | ~3 TB | ~15 TB | ~45 TB |
 | Generation time (one machine) | ~13h | ~65h | ~195h |
+| Upload time (laptop, ~10 MB/s) | ~15h | ~77h | ~232h |
 
-- Neither local disk (~3 GB at any time) nor upload bandwidth is the limit any more:
-  generation is. A cluster-week's blocks upload in parallel, so the stream count is
-  `MAX_INFLIGHT` × `UPLOAD_BLOCK_PARALLEL` — 9 at the defaults, which outruns generation in
-  all three categories even from a laptop.
-- Tune the stream count, not a single transfer. One stream to us-west-2 measured 3.6 MB/s and
-  barely moved with `max_concurrent_requests=40`; four parallel streams reached 11 MB/s
-  aggregate. Throughput comes from more streams, but the aggregate saturates, so past roughly
-  a dozen there is nothing left to win. For categories 2 and 3 still prefer a machine in the
-  bucket's region (an EC2 instance in us-west-2). Ctrl-C stops the run; re-run the same
-  command to resume.
+- Local disk is no longer a constraint (~3 GB at any time), but upload bandwidth still is —
+  narrowly. A cluster-week's blocks upload in parallel, so the stream count is
+  `MAX_INFLIGHT` × `UPLOAD_BLOCK_PARALLEL`, 9 at the defaults, which sustained **10.1 MB/s**
+  from a laptop to us-west-2 with generation running (measured over a 1-cluster × 5-week run,
+  5.4 GB). That is roughly twice the serial-upload rate and brings upload to within ~20% of
+  generation instead of double it, but upload is still what finishes last in every category.
+- Tune the stream count, not a single transfer, and expect it to saturate early. One stream
+  measured 3.6 MB/s and barely moved with `max_concurrent_requests=40`; four streams reached
+  11 MB/s aggregate, and nine sustained 10.1 MB/s with generation competing. The link, not the
+  stream count, is the ceiling past roughly four or five streams, so raising `MAX_INFLIGHT` or
+  `UPLOAD_BLOCK_PARALLEL` above the defaults mostly buys local disk pressure. For categories 2
+  and 3 run the generator in the bucket's region (an EC2 instance in us-west-2), where that
+  ceiling is far higher. Ctrl-C stops the run; re-run the same command to resume.
 - A cluster-week whose upload fails is retried in bounded batches after generation finishes
   (`UPLOAD_RETRY_ROUNDS`, default 3). Retries re-upload from the local copy and never
   regenerate, so a transient S3 error no longer costs a second invocation.
