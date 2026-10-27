@@ -38,6 +38,11 @@ NUM_POD_METRICS="${NUM_POD_METRICS:-20}"
 NUM_CLUSTER_METRICS="${NUM_CLUSTER_METRICS:-154}"
 WORKERS="${WORKERS:-8}"
 MAX_INFLIGHT="${MAX_INFLIGHT:-3}"                    # cluster-weeks on local disk at once (~1 GB each)
+UPLOAD_BLOCK_PARALLEL="${UPLOAD_BLOCK_PARALLEL:-3}"  # blocks of one cluster-week uploaded at once; a single
+                                                     # stream to S3 tops out near 3.6 MB/s regardless of its
+                                                     # own concurrency, so throughput comes from more streams
+UPLOAD_RETRY_ROUNDS="${UPLOAD_RETRY_ROUNDS:-3}"      # extra end-of-run attempts for failed cluster-week uploads
+UPLOAD_RETRY_DELAY_SECONDS="${UPLOAD_RETRY_DELAY_SECONDS:-30}" # backoff before retry rounds 2+ (30s, 60s, ...)
 WORK="${WORK:-./gen-work}"
 TB="${TB:-$(cd "$(dirname "$0")/.." && pwd)/thanosbench}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -62,10 +67,11 @@ GEN_SECONDS_PER_CLUSTER_WEEK="${GEN_SECONDS_PER_CLUSTER_WEEK:-90}"   # measured 
 DS_5M_RATIO="${DS_5M_RATIO:-3.8}"; DS_1H_RATIO="${DS_1H_RATIO:-1.1}"
 
 # ---- validation --------------------------------------------------------------
-for v in WEEKS NUM_NAMESPACES NUM_WORKLOADS NUM_PODS NUM_EXTRA_METRICS NUM_POD_METRICS NUM_CLUSTER_METRICS MAX_INFLIGHT WORKERS; do
+for v in WEEKS NUM_NAMESPACES NUM_WORKLOADS NUM_PODS NUM_EXTRA_METRICS NUM_POD_METRICS NUM_CLUSTER_METRICS MAX_INFLIGHT UPLOAD_BLOCK_PARALLEL WORKERS UPLOAD_RETRY_ROUNDS UPLOAD_RETRY_DELAY_SECONDS; do
   [[ "${!v}" =~ ^(0|[1-9][0-9]{0,8})$ ]] || { echo "ABORT: ${v}='${!v}' must be a non-negative integer." >&2; exit 1; }
 done
 [[ "$WEEKS" -ge 1 && "$MAX_INFLIGHT" -ge 1 ]] || { echo "ABORT: WEEKS and MAX_INFLIGHT must be >= 1." >&2; exit 1; }
+[[ "$UPLOAD_BLOCK_PARALLEL" -ge 1 ]] || { echo "ABORT: UPLOAD_BLOCK_PARALLEL must be >= 1." >&2; exit 1; }
 for p in BUCKET SHARED_PREFIX; do
   [[ -n "${!p}" ]] || { echo "ABORT: $p is required." >&2; exit 1; }
 done
@@ -125,6 +131,8 @@ else
 fi
 echo "  projected:    ~$PROJ_GB GB to upload; ~$HUB_GB GB on the hub after downsampling; peak local disk ~$LOCAL_GB GB (MAX_INFLIGHT=$MAX_INFLIGHT)"
 echo "  time:         ~$GEN_H h of generation at ${GEN_SECONDS_PER_CLUSTER_WEEK}s per cluster-week; uploads overlap with generation"
+echo "  uploads:      $MAX_INFLIGHT cluster-week(s) in flight x $UPLOAD_BLOCK_PARALLEL parallel block(s) = up to $(( MAX_INFLIGHT * UPLOAD_BLOCK_PARALLEL )) concurrent S3 streams"
+echo "  retries:      $UPLOAD_RETRY_ROUNDS end-of-run upload round(s); retry backoff starts at ${UPLOAD_RETRY_DELAY_SECONDS}s"
 python3 -c "import sys; sys.exit(0 if $SPB > 5000000 else 1)" && { echo "ABORT: $SPB series/block > maxSeriesPerBlock=5,000,000." >&2; exit 1; }
 [[ "$DRY_RUN" == "1" ]] && { echo "== DRY_RUN: nothing generated or uploaded. =="; exit 0; }
 mkdir -p "$WORK/state" "$WORK/tmp" "$WORK/log"
@@ -193,6 +201,35 @@ upload_block() { # $1=dir $2=ulid $3=prefix : data first, meta.json last
   s3cp "$1/$2/meta.json" "s3://$BUCKET/$3/$2/meta.json" || { echo "upload of $2 meta.json failed"; return 1; }
   s3_has_meta "$3" "$2" || { echo "upload of $2 not visible in S3"; return 1; }
 }
+# Blocks of a cluster-week are independent, so they upload in parallel: one stream
+# to S3 tops out near 3.6 MB/s however much concurrency it is given internally, so
+# throughput comes from running more streams, not from tuning one. Largest first,
+# so a batch is not held open by a 280 MB block queued behind small ones. The
+# data-then-meta.json order that stops a reader seeing a partial block is inside
+# upload_block, per block, so uploading different blocks at once does not affect it.
+ulids_largest_first() { # $1=dir $2=ulids file
+  local b
+  while read -r b; do echo "$(du -sk "$1/$b" 2>/dev/null | cut -f1) $b"; done < "$2" | sort -rn | awk '{print $NF}'
+}
+upload_cw_blocks() { # $1=dir $2=ulids file $3=prefix : returns 1 if any block failed
+  local u pid rc=0 pids=()
+  for u in $(ulids_largest_first "$1" "$2"); do
+    upload_block "$1" "$u" "$3" &
+    pids+=($!)
+    if [[ "${#pids[@]}" -ge "$UPLOAD_BLOCK_PARALLEL" ]]; then
+      for pid in "${pids[@]}"; do wait "$pid" || rc=1; done
+      pids=()
+      # the serial loop this replaced stopped at the first bad block; keep that,
+      # or a cluster-week doomed by expired credentials uploads its whole 1 GB
+      [[ "$rc" -eq 0 ]] || break
+    fi
+  done
+  # bash 3.2 treats "${empty[@]}" as an unbound variable under set -u
+  if [[ "${#pids[@]}" -gt 0 ]]; then
+    for pid in "${pids[@]}"; do wait "$pid" || rc=1; done
+  fi
+  return "$rc"
+}
 copy_block() { # $1=ulid $2=source_prefix : source -> hub, server-side, meta.json last
   s3cp --recursive "s3://$BUCKET/$2/$1/" "s3://$BUCKET/$HUB_PREFIX/$1/" --exclude meta.json || { echo "copy of $1 data failed"; return 1; }
   s3cp "s3://$BUCKET/$2/$1/meta.json" "s3://$BUCKET/$HUB_PREFIX/$1/meta.json" || { echo "copy of $1 meta.json failed"; return 1; }
@@ -206,10 +243,10 @@ copy_cw_to_hub() { # $1=cluster $2=ulids file : copy the blocks not yet in HUB_P
   done < "$2"
 }
 publish_body() { # $1=cluster $2=week $3=dir
-  local u pfx
+  local pfx
   pfx="$(shared_prefix_for "$1")"
   # 1. the whole cluster-week into the shared prefix first ...
-  while read -r u; do upload_block "$3" "$u" "$pfx" || return 1; done < "$WORK/state/$1.w$2.ulids"
+  upload_cw_blocks "$3" "$WORK/state/$1.w$2.ulids" "$pfx" || return 1
   # 2. ... then into the hub prefix. Nothing reaches the hub (and its compactor)
   #    before the shared copy is complete, so a resume never has to regenerate a
   #    cluster-week the hub has already seen (see the resume step).
@@ -218,11 +255,11 @@ publish_body() { # $1=cluster $2=week $3=dir
   rm -rf "$3"
   echo "done"
 }
-publish_cw() { # $1=cluster $2=week $3=dir ; runs in the background
-  trap 'pkill -TERM -P $BASHPID 2>/dev/null; exit 143' TERM INT   # stop our aws children when the run is interrupted
-  if publish_body "$1" "$2" "$3" > "$WORK/log/$1-w$2.upload.log" 2>&1; then :; else
-    touch "$WORK/state/$1.w$2.failed"; echo "FAILED (see $WORK/log/$1-w$2.upload.log)" >> "$WORK/log/$1-w$2.upload.log"
-    log "upload of $1 week $2 FAILED ($(tail -1 "$WORK/log/$1-w$2.upload.log" | cut -c1-120)); the run continues and will report INCOMPLETE" >&2
+publish_cw() { # $1=cluster $2=week $3=dir $4=attempt label; runs in the background
+  local upload_log="$WORK/log/$1-w$2.upload.log" attempt="${4:-initial}"
+  if { echo "== $attempt upload attempt at $(date -u +%Y-%m-%dT%H:%M:%SZ) =="; publish_body "$1" "$2" "$3"; } >> "$upload_log" 2>&1; then :; else
+    touch "$WORK/state/$1.w$2.failed"; echo "FAILED (see $upload_log)" >> "$upload_log"
+    log "upload of $1 week $2 FAILED ($(tail -1 "$upload_log" | cut -c1-120)); the run continues and will retry at the end" >&2
   fi
 }
 
@@ -240,12 +277,82 @@ inflight() {
 count_state() { find "$WORK/state" -maxdepth 1 -name "*.$1" | wc -l | tr -d ' '; }   # $1 = done | failed | ulids
 wait_for_slot() { while [[ "$(inflight)" -ge "$MAX_INFLIGHT" ]]; do sleep 5; done; }
 
+# bash 3.2 has no BASHPID, so a background subshell cannot name itself to
+# `pkill -P` -- under `set -u` such a trap dies on the unbound variable and the
+# aws processes outlive the run, still writing to S3 while the next run resumes.
+# Walk the tree from the top-level shell instead, where $$ is correct, deepest
+# first so each aws is signalled before the shell that is waiting on it.
+kill_descendants() { # $1=pid
+  local child
+  for child in $(pgrep -P "$1" 2>/dev/null); do
+    kill_descendants "$child"
+    kill -TERM "$child" 2>/dev/null || true
+  done
+}
+
+# Retry failed uploads in bounded batches after generation finishes. The local
+# blocks and their ULIDs are preserved by publish_cw, so retries never regenerate
+# data and are idempotent. A visibility failure may mean every meta.json actually
+# arrived; settle that case without uploading again. Later rounds use exponential
+# backoff to give transient S3/network/clock-sync problems time to recover.
+retry_failed_uploads() {
+  local round delay f b cluster w dir present u batch pfx
+  [[ "$UPLOAD_RETRY_ROUNDS" -gt 0 ]] || return 0
+  for (( round = 1; round <= UPLOAD_RETRY_ROUNDS; round++ )); do
+    [[ "$(count_state failed)" -gt 0 ]] || return 0
+    if [[ "$round" -gt 1 && "$UPLOAD_RETRY_DELAY_SECONDS" -gt 0 ]]; then
+      delay=$(( UPLOAD_RETRY_DELAY_SECONDS * (1 << (round - 2)) ))
+      log "upload retry round $round/$UPLOAD_RETRY_ROUNDS: waiting ${delay}s"
+      sleep "$delay"
+    fi
+    log "upload retry round $round/$UPLOAD_RETRY_ROUNDS: retrying $(count_state failed) failed cluster-week(s)"
+    batch=0
+    for f in "$WORK"/state/*.failed; do
+      [[ -e "$f" ]] || continue
+      b="$(basename "$f" .failed)"; cluster="${b%.w*}"; w="${b##*.w}"; dir="$WORK/tmp/$cluster-w$w"
+      if [[ -f "$WORK/state/$b.done" ]]; then
+        rm -f "$f"
+        continue
+      fi
+      if [[ ! -f "$WORK/state/$b.ulids" ]]; then
+        log "upload retry: $cluster week $w has no ULID state; leaving it failed for a normal resume"
+        continue
+      fi
+      pfx="$(shared_prefix_for "$cluster")"
+      present=0
+      while read -r u; do s3_has_meta "$pfx" "$u" && present=$((present+1)); done < "$WORK/state/$b.ulids"
+      if [[ "$present" -eq "$BLOCKS_PER_WEEK" ]]; then
+        log "upload retry: $cluster week $w is already complete in the shared prefix; finishing any hub copy"
+        if [[ -n "$HUB_PREFIX" ]] && ! copy_cw_to_hub "$cluster" "$WORK/state/$b.ulids" >> "$WORK/log/$cluster-w$w.upload.log" 2>&1; then
+          log "upload retry: $cluster week $w hub copy still failed"
+          continue
+        fi
+        mv "$WORK/state/$b.ulids" "$WORK/state/$b.done"
+        rm -f "$f"; rm -rf "$dir"
+        continue
+      fi
+      if [[ ! -d "$dir" || "$(complete_blocks_in "$dir")" -ne "$BLOCKS_PER_WEEK" ]]; then
+        log "upload retry: $cluster week $w lacks a complete local copy; leaving it failed for a normal resume"
+        continue
+      fi
+      rm -f "$f"
+      publish_cw "$cluster" "$w" "$dir" "retry-$round" &
+      batch=$((batch+1))
+      if [[ "$batch" -ge "$MAX_INFLIGHT" ]]; then wait; batch=0; fi
+    done
+    wait
+  done
+}
+
 # resume: a tmp dir without a .ulids file is an interrupted generation; nothing of it is in S3
 for d in "$WORK"/tmp/*/; do
   [[ -d "$d" ]] || continue
   b="$(basename "$d")"; [[ -f "$WORK/state/${b%-w*}.w${b##*-w}.ulids" ]] || { log "resume: removing half-generated $b"; rm -rf "$d"; }
 done
-# resume: settle cluster-weeks that were generated but not confirmed
+# resume: settle cluster-weeks that were generated but not confirmed. wait_for_slot
+# cannot bound this loop -- inflight() counts tmp dirs, and after an outage they all
+# exist before any upload starts, so it would block forever; count launches instead.
+resume_batch=0
 for f in "$WORK"/state/*.ulids; do
   [[ -e "$f" ]] || continue
   b="$(basename "$f" .ulids)"; cluster="${b%.w*}"; w="${b##*.w}"; dir="$WORK/tmp/$cluster-w$w"
@@ -262,6 +369,8 @@ for f in "$WORK"/state/*.ulids; do
     log "resume: $cluster week $w generated locally, re-uploading its $present partial block(s) and the rest"
     while read -r u; do s3_rm_block "$pfx" "$u"; done < "$f"
     publish_cw "$cluster" "$w" "$dir" &
+    resume_batch=$((resume_batch+1))
+    if [[ "$resume_batch" -ge "$MAX_INFLIGHT" ]]; then wait; resume_batch=0; fi
   else
     # shared copy incomplete and no local copy: nothing of it reached the hub
     # prefix (the hub copy starts only after the shared copy is complete)
@@ -273,7 +382,7 @@ done
 find "$WORK/state" -maxdepth 1 -name '*.failed' -delete
 
 # ---- main loop ---------------------------------------------------------------
-trap 'trap - INT TERM; echo; log "interrupted: stopping uploads (re-run the same command to resume)"; pkill -TERM -P $$ 2>/dev/null; wait; exit 130' INT TERM
+trap 'trap - INT TERM; echo; log "interrupted: stopping uploads (re-run the same command to resume)"; kill_descendants $$; wait; exit 130' INT TERM
 START=$(date +%s); i=0
 for cluster in $CLUSTERS; do
   for (( w = 0; w < WEEKS; w++ )); do
@@ -291,6 +400,7 @@ for cluster in $CLUSTERS; do
   done
 done
 wait
+retry_failed_uploads
 
 # ---- finish ------------------------------------------------------------------
 FAILED=$(count_state "failed")
