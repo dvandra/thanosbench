@@ -38,6 +38,8 @@ NUM_POD_METRICS="${NUM_POD_METRICS:-20}"
 NUM_CLUSTER_METRICS="${NUM_CLUSTER_METRICS:-154}"
 WORKERS="${WORKERS:-8}"
 MAX_INFLIGHT="${MAX_INFLIGHT:-3}"                    # cluster-weeks on local disk at once (~1 GB each)
+UPLOAD_RETRY_ROUNDS="${UPLOAD_RETRY_ROUNDS:-3}"      # extra end-of-run attempts for failed cluster-week uploads
+UPLOAD_RETRY_DELAY_SECONDS="${UPLOAD_RETRY_DELAY_SECONDS:-30}" # backoff before retry rounds 2+ (30s, 60s, ...)
 WORK="${WORK:-./gen-work}"
 TB="${TB:-$(cd "$(dirname "$0")/.." && pwd)/thanosbench}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -62,7 +64,7 @@ GEN_SECONDS_PER_CLUSTER_WEEK="${GEN_SECONDS_PER_CLUSTER_WEEK:-90}"   # measured 
 DS_5M_RATIO="${DS_5M_RATIO:-3.8}"; DS_1H_RATIO="${DS_1H_RATIO:-1.1}"
 
 # ---- validation --------------------------------------------------------------
-for v in WEEKS NUM_NAMESPACES NUM_WORKLOADS NUM_PODS NUM_EXTRA_METRICS NUM_POD_METRICS NUM_CLUSTER_METRICS MAX_INFLIGHT WORKERS; do
+for v in WEEKS NUM_NAMESPACES NUM_WORKLOADS NUM_PODS NUM_EXTRA_METRICS NUM_POD_METRICS NUM_CLUSTER_METRICS MAX_INFLIGHT WORKERS UPLOAD_RETRY_ROUNDS UPLOAD_RETRY_DELAY_SECONDS; do
   [[ "${!v}" =~ ^(0|[1-9][0-9]{0,8})$ ]] || { echo "ABORT: ${v}='${!v}' must be a non-negative integer." >&2; exit 1; }
 done
 [[ "$WEEKS" -ge 1 && "$MAX_INFLIGHT" -ge 1 ]] || { echo "ABORT: WEEKS and MAX_INFLIGHT must be >= 1." >&2; exit 1; }
@@ -125,6 +127,7 @@ else
 fi
 echo "  projected:    ~$PROJ_GB GB to upload; ~$HUB_GB GB on the hub after downsampling; peak local disk ~$LOCAL_GB GB (MAX_INFLIGHT=$MAX_INFLIGHT)"
 echo "  time:         ~$GEN_H h of generation at ${GEN_SECONDS_PER_CLUSTER_WEEK}s per cluster-week; uploads overlap with generation"
+echo "  retries:      $UPLOAD_RETRY_ROUNDS end-of-run upload round(s); retry backoff starts at ${UPLOAD_RETRY_DELAY_SECONDS}s"
 python3 -c "import sys; sys.exit(0 if $SPB > 5000000 else 1)" && { echo "ABORT: $SPB series/block > maxSeriesPerBlock=5,000,000." >&2; exit 1; }
 [[ "$DRY_RUN" == "1" ]] && { echo "== DRY_RUN: nothing generated or uploaded. =="; exit 0; }
 mkdir -p "$WORK/state" "$WORK/tmp" "$WORK/log"
@@ -218,11 +221,12 @@ publish_body() { # $1=cluster $2=week $3=dir
   rm -rf "$3"
   echo "done"
 }
-publish_cw() { # $1=cluster $2=week $3=dir ; runs in the background
+publish_cw() { # $1=cluster $2=week $3=dir $4=attempt label; runs in the background
+  local upload_log="$WORK/log/$1-w$2.upload.log" attempt="${4:-initial}"
   trap 'pkill -TERM -P $BASHPID 2>/dev/null; exit 143' TERM INT   # stop our aws children when the run is interrupted
-  if publish_body "$1" "$2" "$3" > "$WORK/log/$1-w$2.upload.log" 2>&1; then :; else
-    touch "$WORK/state/$1.w$2.failed"; echo "FAILED (see $WORK/log/$1-w$2.upload.log)" >> "$WORK/log/$1-w$2.upload.log"
-    log "upload of $1 week $2 FAILED ($(tail -1 "$WORK/log/$1-w$2.upload.log" | cut -c1-120)); the run continues and will report INCOMPLETE" >&2
+  if { echo "== $attempt upload attempt at $(date -u +%Y-%m-%dT%H:%M:%SZ) =="; publish_body "$1" "$2" "$3"; } >> "$upload_log" 2>&1; then :; else
+    touch "$WORK/state/$1.w$2.failed"; echo "FAILED (see $upload_log)" >> "$upload_log"
+    log "upload of $1 week $2 FAILED ($(tail -1 "$upload_log" | cut -c1-120)); the run continues and will retry at the end" >&2
   fi
 }
 
@@ -239,6 +243,60 @@ inflight() {
 }
 count_state() { find "$WORK/state" -maxdepth 1 -name "*.$1" | wc -l | tr -d ' '; }   # $1 = done | failed | ulids
 wait_for_slot() { while [[ "$(inflight)" -ge "$MAX_INFLIGHT" ]]; do sleep 5; done; }
+
+# Retry failed uploads in bounded batches after generation finishes. The local
+# blocks and their ULIDs are preserved by publish_cw, so retries never regenerate
+# data and are idempotent. A visibility failure may mean every meta.json actually
+# arrived; settle that case without uploading again. Later rounds use exponential
+# backoff to give transient S3/network/clock-sync problems time to recover.
+retry_failed_uploads() {
+  local round delay f b cluster w dir present u batch pfx
+  [[ "$UPLOAD_RETRY_ROUNDS" -gt 0 ]] || return 0
+  for (( round = 1; round <= UPLOAD_RETRY_ROUNDS; round++ )); do
+    [[ "$(count_state failed)" -gt 0 ]] || return 0
+    if [[ "$round" -gt 1 && "$UPLOAD_RETRY_DELAY_SECONDS" -gt 0 ]]; then
+      delay=$(( UPLOAD_RETRY_DELAY_SECONDS * (1 << (round - 2)) ))
+      log "upload retry round $round/$UPLOAD_RETRY_ROUNDS: waiting ${delay}s"
+      sleep "$delay"
+    fi
+    log "upload retry round $round/$UPLOAD_RETRY_ROUNDS: retrying $(count_state failed) failed cluster-week(s)"
+    batch=0
+    for f in "$WORK"/state/*.failed; do
+      [[ -e "$f" ]] || continue
+      b="$(basename "$f" .failed)"; cluster="${b%.w*}"; w="${b##*.w}"; dir="$WORK/tmp/$cluster-w$w"
+      if [[ -f "$WORK/state/$b.done" ]]; then
+        rm -f "$f"
+        continue
+      fi
+      if [[ ! -f "$WORK/state/$b.ulids" ]]; then
+        log "upload retry: $cluster week $w has no ULID state; leaving it failed for a normal resume"
+        continue
+      fi
+      pfx="$(shared_prefix_for "$cluster")"
+      present=0
+      while read -r u; do s3_has_meta "$pfx" "$u" && present=$((present+1)); done < "$WORK/state/$b.ulids"
+      if [[ "$present" -eq "$BLOCKS_PER_WEEK" ]]; then
+        log "upload retry: $cluster week $w is already complete in the shared prefix; finishing any hub copy"
+        if [[ -n "$HUB_PREFIX" ]] && ! copy_cw_to_hub "$cluster" "$WORK/state/$b.ulids" >> "$WORK/log/$cluster-w$w.upload.log" 2>&1; then
+          log "upload retry: $cluster week $w hub copy still failed"
+          continue
+        fi
+        mv "$WORK/state/$b.ulids" "$WORK/state/$b.done"
+        rm -f "$f"; rm -rf "$dir"
+        continue
+      fi
+      if [[ ! -d "$dir" || "$(complete_blocks_in "$dir")" -ne "$BLOCKS_PER_WEEK" ]]; then
+        log "upload retry: $cluster week $w lacks a complete local copy; leaving it failed for a normal resume"
+        continue
+      fi
+      rm -f "$f"
+      publish_cw "$cluster" "$w" "$dir" "retry-$round" &
+      batch=$((batch+1))
+      if [[ "$batch" -ge "$MAX_INFLIGHT" ]]; then wait; batch=0; fi
+    done
+    wait
+  done
+}
 
 # resume: a tmp dir without a .ulids file is an interrupted generation; nothing of it is in S3
 for d in "$WORK"/tmp/*/; do
@@ -291,6 +349,7 @@ for cluster in $CLUSTERS; do
   done
 done
 wait
+retry_failed_uploads
 
 # ---- finish ------------------------------------------------------------------
 FAILED=$(count_state "failed")
