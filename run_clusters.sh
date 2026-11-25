@@ -37,7 +37,9 @@ for ((i = START; i <= END; i++)); do
   CLUSTERS="${CLUSTERS:+$CLUSTERS }ac-test-man-$i"
 done
 
-WORK_DIR="./gen-work-${START}-${END}"
+# Honor WORK if the caller set it (e.g. a fresh smoke-test dir); otherwise
+# default to gen-work-<start>-<end> so ranges stay isolated.
+WORK_DIR="${WORK:-./gen-work-${START}-${END}}"
 
 export PATH="/usr/local/aws-cli:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
@@ -54,6 +56,8 @@ exec caffeinate -dimsu env -u HUB_PREFIX \
   NUM_EXTRA_METRICS="${NUM_EXTRA_METRICS:-0}" \
   NUM_POD_METRICS="${NUM_POD_METRICS:-20}" \
   NUM_CLUSTER_METRICS="${NUM_CLUSTER_METRICS:-154}" \
+  NUM_NODES="${NUM_NODES:-0}" \
+  NUM_NODE_METRICS="${NUM_NODE_METRICS:-0}" \
   RS_SCRAPE_INTERVAL="${RS_SCRAPE_INTERVAL:-15m}" \
   PROFILE="${PROFILE:-custom-continous-1-week-full}" \
   BUCKET="${BUCKET:-oia-rs}" \
@@ -61,6 +65,8 @@ exec caffeinate -dimsu env -u HUB_PREFIX \
   PER_CLUSTER_PREFIX="${PER_CLUSTER_PREFIX:-1}" \
   AWS_PROFILE_NAME="${AWS_PROFILE_NAME:-default}" \
   MAX_INFLIGHT="${MAX_INFLIGHT:-3}" \
+  SKIP_UPLOAD="${SKIP_UPLOAD:-0}" \
+  LOCAL_ROOT="${LOCAL_ROOT:-$WORK_DIR/out}" \
   WORK="$WORK_DIR" \
   MANIFEST="$WORK_DIR/manifest.final.json" \
   BASE_EPOCH_OVERRIDE="${BASE_EPOCH_OVERRIDE:-1792800000}" \

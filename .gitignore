@@ -26,3 +26,9 @@ vendor/
 encoded_thanos*.txt
 test
 gen-work*/
+
+# Sensitive Kubernetes Secret (contains encoded S3 credentials)
+thanos-object-storage-secret.yaml
+
+# Local blockgen leftovers
+chunks_head/

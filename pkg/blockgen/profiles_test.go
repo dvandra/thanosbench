@@ -482,6 +482,53 @@ func TestRightSizingLeveledPodFiller(t *testing.T) {
 	}
 }
 
+// TestRightSizingLeveledNodeFiller verifies NUM_NODE_METRICS emits one series per
+// node per filler metric, with a node label and no right-sizing profile.
+func TestRightSizingLeveledNodeFiller(t *testing.T) {
+	t.Setenv("NUM_NAMESPACES", "1")
+	t.Setenv("NUM_WORKLOADS", "1")
+	t.Setenv("NUM_PODS", "1")
+	t.Setenv("NUM_EXTRA_METRICS", "0")
+	t.Setenv("NUM_POD_METRICS", "0")
+	t.Setenv("NUM_CLUSTER_METRICS", "0")
+	t.Setenv("NUM_NODES", "4")
+	t.Setenv("NUM_NODE_METRICS", "2")
+
+	blocks := collectBlocks(t, rightSizingLeveled([]time.Duration{2 * time.Hour}))
+	counts := countByName(blocks[0])
+
+	for _, name := range []string{"extra_node_metric_1", "extra_node_metric_2"} {
+		if got := counts[name]; got != 4 {
+			t.Errorf("%s: got %d series, want 4 (one per node)", name, got)
+		}
+	}
+	if got := counts["extra_node_metric_3"]; got != 0 {
+		t.Errorf("extra_node_metric_3 should not exist with NUM_NODE_METRICS=2, got %d", got)
+	}
+	// 1 namespace x 1 workload x 1 pod, 3 profiles, 8 measures, plus namespace
+	// hard and pod info: 3*(8*4+2+1)=105, plus 2 node metrics x 4 nodes.
+	if got, want := len(blocks[0].Series), 105+8; got != want {
+		t.Errorf("block series = %d, want %d", got, want)
+	}
+	nodes := map[string]bool{}
+	for _, s := range blocks[0].Series {
+		name := s.Labels.Get("__name__")
+		if !strings.HasPrefix(name, "extra_node_metric_") {
+			continue
+		}
+		if s.Labels.Get("profile") != "" {
+			t.Errorf("%s has a profile label", name)
+		}
+		if got, want := breakdownNames(s.Labels), []string{"node"}; !equalStrings(got, want) {
+			t.Errorf("%s: got breakdown labels %v, want %v", name, got, want)
+		}
+		nodes[s.Labels.Get("node")] = true
+	}
+	if len(nodes) != 4 {
+		t.Errorf("got %d distinct nodes, want 4", len(nodes))
+	}
+}
+
 // TestRightSizingLeveledScrapeIntervalGuardUnsortedRanges checks the guard looks
 // at every block length, not only the first one in the range list.
 func TestRightSizingLeveledScrapeIntervalGuardUnsortedRanges(t *testing.T) {

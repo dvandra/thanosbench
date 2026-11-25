@@ -36,6 +36,8 @@ NUM_PODS="${NUM_PODS:-3}"
 NUM_EXTRA_METRICS="${NUM_EXTRA_METRICS:-0}"
 NUM_POD_METRICS="${NUM_POD_METRICS:-20}"
 NUM_CLUSTER_METRICS="${NUM_CLUSTER_METRICS:-154}"
+NUM_NODES="${NUM_NODES:-0}"
+NUM_NODE_METRICS="${NUM_NODE_METRICS:-0}"
 WORKERS="${WORKERS:-8}"
 MAX_INFLIGHT="${MAX_INFLIGHT:-3}"                    # cluster-weeks on local disk at once (~1 GB each)
 UPLOAD_BLOCK_PARALLEL="${UPLOAD_BLOCK_PARALLEL:-3}"  # blocks of one cluster-week uploaded at once; a single
@@ -46,6 +48,7 @@ UPLOAD_RETRY_DELAY_SECONDS="${UPLOAD_RETRY_DELAY_SECONDS:-30}" # backoff before 
 WORK="${WORK:-./gen-work}"
 TB="${TB:-$(cd "$(dirname "$0")/.." && pwd)/thanosbench}"
 DRY_RUN="${DRY_RUN:-0}"
+SKIP_UPLOAD="${SKIP_UPLOAD:-0}"                      # 1 = generate locally only; never touch S3
 
 # generate_cw changes into the per-week directory before invoking thanosbench.
 # Keep WORK absolute so --output.dir and every state/log path still refer to the
@@ -60,6 +63,11 @@ SHARED_PREFIX="${SHARED_PREFIX:-}"                   # e.g. rs-perf-shared/20c-1
 HUB_PREFIX="${HUB_PREFIX:-}"                         # optional: the hub's own Thanos prefix (server-side copy)
 PER_CLUSTER_PREFIX="${PER_CLUSTER_PREFIX:-0}"         # 1 = store blocks under SHARED_PREFIX/<cluster>/
 AWS_PROFILE_NAME="${AWS_PROFILE_NAME:-oia-rs}"       # empty -> ambient AWS credentials
+LOCAL_ROOT="${LOCAL_ROOT:-$WORK/out}"                # where SKIP_UPLOAD=1 keeps finished blocks
+case "$LOCAL_ROOT" in
+  /*) ;;
+  *) LOCAL_ROOT="$(pwd)/${LOCAL_ROOT#./}" ;;
+esac
 
 BYTES_PER_SAMPLE="${BYTES_PER_SAMPLE:-9.9}"
 FILLER_BYTES_PER_SAMPLE="${FILLER_BYTES_PER_SAMPLE:-4.6}"
@@ -67,19 +75,25 @@ GEN_SECONDS_PER_CLUSTER_WEEK="${GEN_SECONDS_PER_CLUSTER_WEEK:-90}"   # measured 
 DS_5M_RATIO="${DS_5M_RATIO:-3.8}"; DS_1H_RATIO="${DS_1H_RATIO:-1.1}"
 
 # ---- validation --------------------------------------------------------------
-for v in WEEKS NUM_NAMESPACES NUM_WORKLOADS NUM_PODS NUM_EXTRA_METRICS NUM_POD_METRICS NUM_CLUSTER_METRICS MAX_INFLIGHT UPLOAD_BLOCK_PARALLEL WORKERS UPLOAD_RETRY_ROUNDS UPLOAD_RETRY_DELAY_SECONDS; do
+for v in WEEKS NUM_NAMESPACES NUM_WORKLOADS NUM_PODS NUM_EXTRA_METRICS NUM_POD_METRICS NUM_CLUSTER_METRICS NUM_NODES NUM_NODE_METRICS MAX_INFLIGHT UPLOAD_BLOCK_PARALLEL WORKERS UPLOAD_RETRY_ROUNDS UPLOAD_RETRY_DELAY_SECONDS; do
   [[ "${!v}" =~ ^(0|[1-9][0-9]{0,8})$ ]] || { echo "ABORT: ${v}='${!v}' must be a non-negative integer." >&2; exit 1; }
 done
 [[ "$WEEKS" -ge 1 && "$MAX_INFLIGHT" -ge 1 ]] || { echo "ABORT: WEEKS and MAX_INFLIGHT must be >= 1." >&2; exit 1; }
 [[ "$UPLOAD_BLOCK_PARALLEL" -ge 1 ]] || { echo "ABORT: UPLOAD_BLOCK_PARALLEL must be >= 1." >&2; exit 1; }
-for p in BUCKET SHARED_PREFIX; do
-  [[ -n "${!p}" ]] || { echo "ABORT: $p is required." >&2; exit 1; }
-done
-for p in SHARED_PREFIX HUB_PREFIX; do
-  v="${!p}"; [[ -z "$v" ]] && continue
-  [[ "$v" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] || { echo "ABORT: $p='$v' must be a plain prefix like a/b (no leading or trailing slash, no spaces)." >&2; exit 1; }
-done
-[[ -z "$HUB_PREFIX" || "$HUB_PREFIX" != "$SHARED_PREFIX" ]] || { echo "ABORT: HUB_PREFIX must differ from SHARED_PREFIX." >&2; exit 1; }
+if [[ "$SKIP_UPLOAD" != "1" ]]; then
+  for p in BUCKET SHARED_PREFIX; do
+    [[ -n "${!p}" ]] || { echo "ABORT: $p is required (or set SKIP_UPLOAD=1 for local-only)." >&2; exit 1; }
+  done
+  for p in SHARED_PREFIX HUB_PREFIX; do
+    v="${!p}"; [[ -z "$v" ]] && continue
+    [[ "$v" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] || { echo "ABORT: $p='$v' must be a plain prefix like a/b (no leading or trailing slash, no spaces)." >&2; exit 1; }
+  done
+  [[ -z "$HUB_PREFIX" || "$HUB_PREFIX" != "$SHARED_PREFIX" ]] || { echo "ABORT: HUB_PREFIX must differ from SHARED_PREFIX." >&2; exit 1; }
+else
+  BUCKET="${BUCKET:-local}"
+  SHARED_PREFIX="${SHARED_PREFIX:-local-only}"
+  HUB_PREFIX=""
+fi
 [[ -n "${CLUSTERS// /}" ]] || { echo "ABORT: CLUSTERS is empty." >&2; exit 1; }
 # shellcheck disable=SC2086  # split the space-separated cluster list on purpose
 [[ "$(printf '%s\n' $CLUSTERS | sort | uniq -d | wc -l | tr -d ' ')" -eq 0 ]] || { echo "ABORT: CLUSTERS has duplicate names." >&2; exit 1; }
@@ -96,8 +110,8 @@ log() { echo "$(date -u +%H:%M:%S) $*"; }
 # ---- plan --------------------------------------------------------------------
 # shellcheck disable=SC2086  # split the space-separated cluster list on purpose
 NCL=$(printf '%s\n' $CLUSTERS | grep -c .)
-RS_SPB=$(python3 -c "N=$NUM_NAMESPACES;W=$NUM_WORKLOADS;P=$NUM_PODS;print(3*(6*(1+N+N*W+N*W*P)+2*N))")
-FILLER_SPB=$(python3 -c "N=$NUM_NAMESPACES;W=$NUM_WORKLOADS;P=$NUM_PODS;print($NUM_EXTRA_METRICS*N+$NUM_POD_METRICS*N*W*P+$NUM_CLUSTER_METRICS)")
+RS_SPB=$(python3 -c "N=$NUM_NAMESPACES;W=$NUM_WORKLOADS;P=$NUM_PODS;print(3*(8*(1+N+N*W+N*W*P)+2*N+N*W*P))")
+FILLER_SPB=$(python3 -c "N=$NUM_NAMESPACES;W=$NUM_WORKLOADS;P=$NUM_PODS;print($NUM_EXTRA_METRICS*N+$NUM_POD_METRICS*N*W*P+$NUM_NODE_METRICS*$NUM_NODES+$NUM_CLUSTER_METRICS)")
 SPB=$(python3 -c "print($RS_SPB+$FILLER_SPB)")
 TOTAL_CW=$(( NCL * WEEKS ))
 BLOCKS=$(( TOTAL_CW * BLOCKS_PER_WEEK ))
@@ -107,7 +121,11 @@ HUB_GB=$(python3 -c "print('%.1f'%($CW_BYTES*$TOTAL_CW*(1+$DS_5M_RATIO+$DS_1H_RA
 LOCAL_GB=$(python3 -c "print('%.1f'%($CW_BYTES*($MAX_INFLIGHT+1)/1e9))")
 GEN_H=$(python3 -c "print('%.1f'%($TOTAL_CW*$GEN_SECONDS_PER_CLUSTER_WEEK/3600))")
 
-PARAMS="profile=$PROFILE blocks_per_week=$BLOCKS_PER_WEEK clusters=[$CLUSTERS] N=$NUM_NAMESPACES W=$NUM_WORKLOADS P=$NUM_PODS extra=$NUM_EXTRA_METRICS pod=$NUM_POD_METRICS cluster=$NUM_CLUSTER_METRICS rs_interval=${RS_SCRAPE_INTERVAL:-15m} bucket=$BUCKET shared=$SHARED_PREFIX hub=$HUB_PREFIX per_cluster=$PER_CLUSTER_PREFIX"
+NODE_PARAMS=""
+if [[ "$NUM_NODES" != "0" || "$NUM_NODE_METRICS" != "0" ]]; then
+  NODE_PARAMS=" nodes=$NUM_NODES node_metrics=$NUM_NODE_METRICS"
+fi
+PARAMS="profile=$PROFILE blocks_per_week=$BLOCKS_PER_WEEK clusters=[$CLUSTERS] N=$NUM_NAMESPACES W=$NUM_WORKLOADS P=$NUM_PODS extra=$NUM_EXTRA_METRICS pod=$NUM_POD_METRICS cluster=$NUM_CLUSTER_METRICS${NODE_PARAMS} rs_interval=${RS_SCRAPE_INTERVAL:-15m} bucket=$BUCKET shared=$SHARED_PREFIX hub=$HUB_PREFIX per_cluster=$PER_CLUSTER_PREFIX skip_upload=$SKIP_UPLOAD"
 if [[ -f "$WORK/state/params" && "$(cat "$WORK/state/params")" != "$PARAMS" ]]; then
   echo "ABORT: $WORK was started with different parameters:" >&2; echo "  was: $(cat "$WORK/state/params")" >&2; echo "  now: $PARAMS" >&2
   echo "  Only WEEKS may change between runs; use a new WORK dir (and SHARED_PREFIX) for a different dataset." >&2; exit 1
@@ -122,29 +140,40 @@ fi
 echo "== plan =="
 echo "  profile:      $PROFILE ($BLOCKS_PER_WEEK blocks/week)"
 echo "  clusters:     $NCL; weeks: $WEEKS (~$(( WEEKS*7 )) days); cluster-weeks: $TOTAL_CW; blocks: $BLOCKS"
-echo "  cardinality:  N=$NUM_NAMESPACES W=$NUM_WORKLOADS P=$NUM_PODS -> $RS_SPB right-sizing + $FILLER_SPB filler = $SPB series/block"
+echo "  cardinality:  N=$NUM_NAMESPACES W=$NUM_WORKLOADS P=$NUM_PODS nodes=$NUM_NODES -> $RS_SPB right-sizing + $FILLER_SPB filler = $SPB series/block"
 echo "  window:       $(iso $(( BASE_EPOCH - WEEKS*7*86400 ))) .. $(iso "$BASE_EPOCH") (pinned)"
-if [[ "$PER_CLUSTER_PREFIX" == "1" ]]; then
-  echo "  destination:  s3://$BUCKET/$SHARED_PREFIX/<cluster>/${HUB_PREFIX:+  + server-side copy -> s3://$BUCKET/$HUB_PREFIX/}"
+if [[ "$SKIP_UPLOAD" == "1" ]]; then
+  echo "  destination:  LOCAL only -> $LOCAL_ROOT/<cluster>/ (SKIP_UPLOAD=1; no S3)"
+  echo "  projected:    ~$PROJ_GB GB local; peak working set ~$LOCAL_GB GB (MAX_INFLIGHT=$MAX_INFLIGHT)"
+  echo "  time:         ~$GEN_H h of generation at ${GEN_SECONDS_PER_CLUSTER_WEEK}s per cluster-week"
 else
-  echo "  destination:  s3://$BUCKET/$SHARED_PREFIX/${HUB_PREFIX:+  + server-side copy -> s3://$BUCKET/$HUB_PREFIX/}"
+  if [[ "$PER_CLUSTER_PREFIX" == "1" ]]; then
+    echo "  destination:  s3://$BUCKET/$SHARED_PREFIX/<cluster>/${HUB_PREFIX:+  + server-side copy -> s3://$BUCKET/$HUB_PREFIX/}"
+  else
+    echo "  destination:  s3://$BUCKET/$SHARED_PREFIX/${HUB_PREFIX:+  + server-side copy -> s3://$BUCKET/$HUB_PREFIX/}"
+  fi
+  echo "  projected:    ~$PROJ_GB GB to upload; ~$HUB_GB GB on the hub after downsampling; peak local disk ~$LOCAL_GB GB (MAX_INFLIGHT=$MAX_INFLIGHT)"
+  echo "  time:         ~$GEN_H h of generation at ${GEN_SECONDS_PER_CLUSTER_WEEK}s per cluster-week; uploads overlap with generation"
+  echo "  uploads:      $MAX_INFLIGHT cluster-week(s) in flight x $UPLOAD_BLOCK_PARALLEL parallel block(s) = up to $(( MAX_INFLIGHT * UPLOAD_BLOCK_PARALLEL )) concurrent S3 streams"
+  echo "  retries:      $UPLOAD_RETRY_ROUNDS end-of-run upload round(s); retry backoff starts at ${UPLOAD_RETRY_DELAY_SECONDS}s"
 fi
-echo "  projected:    ~$PROJ_GB GB to upload; ~$HUB_GB GB on the hub after downsampling; peak local disk ~$LOCAL_GB GB (MAX_INFLIGHT=$MAX_INFLIGHT)"
-echo "  time:         ~$GEN_H h of generation at ${GEN_SECONDS_PER_CLUSTER_WEEK}s per cluster-week; uploads overlap with generation"
-echo "  uploads:      $MAX_INFLIGHT cluster-week(s) in flight x $UPLOAD_BLOCK_PARALLEL parallel block(s) = up to $(( MAX_INFLIGHT * UPLOAD_BLOCK_PARALLEL )) concurrent S3 streams"
-echo "  retries:      $UPLOAD_RETRY_ROUNDS end-of-run upload round(s); retry backoff starts at ${UPLOAD_RETRY_DELAY_SECONDS}s"
 python3 -c "import sys; sys.exit(0 if $SPB > 5000000 else 1)" && { echo "ABORT: $SPB series/block > maxSeriesPerBlock=5,000,000." >&2; exit 1; }
 [[ "$DRY_RUN" == "1" ]] && { echo "== DRY_RUN: nothing generated or uploaded. =="; exit 0; }
 mkdir -p "$WORK/state" "$WORK/tmp" "$WORK/log"
+[[ "$SKIP_UPLOAD" == "1" ]] && mkdir -p "$LOCAL_ROOT"
 
 # ---- S3 access ---------------------------------------------------------------
-aws_ sts get-caller-identity >/dev/null || { echo "ABORT: AWS credentials not usable (profile '$AWS_PROFILE_NAME')." >&2; exit 1; }
-aws_ s3api head-bucket --bucket "$BUCKET" >/dev/null || { echo "ABORT: cannot access bucket $BUCKET." >&2; exit 1; }
+if [[ "$SKIP_UPLOAD" != "1" ]]; then
+  aws_ sts get-caller-identity >/dev/null || { echo "ABORT: AWS credentials not usable (profile '$AWS_PROFILE_NAME')." >&2; exit 1; }
+  aws_ s3api head-bucket --bucket "$BUCKET" >/dev/null || { echo "ABORT: cannot access bucket $BUCKET." >&2; exit 1; }
+  if [[ ! -f "$WORK/state/base_epoch" ]]; then
+    # a fresh run must not land on top of an existing dataset
+    first_key="$(aws_ s3api list-objects-v2 --bucket "$BUCKET" --prefix "$SHARED_PREFIX/" --max-keys 1 --query 'Contents[0].Key' --output text)" \
+      || { echo "ABORT: cannot list s3://$BUCKET/$SHARED_PREFIX/ (permissions?)." >&2; exit 1; }
+    [[ "$first_key" == "None" ]] || { echo "ABORT: s3://$BUCKET/$SHARED_PREFIX/ is not empty ($first_key) and $WORK has no state for it. Use a new SHARED_PREFIX or the WORK dir of the run that created it." >&2; exit 1; }
+  fi
+fi
 if [[ ! -f "$WORK/state/base_epoch" ]]; then
-  # a fresh run must not land on top of an existing dataset
-  first_key="$(aws_ s3api list-objects-v2 --bucket "$BUCKET" --prefix "$SHARED_PREFIX/" --max-keys 1 --query 'Contents[0].Key' --output text)" \
-    || { echo "ABORT: cannot list s3://$BUCKET/$SHARED_PREFIX/ (permissions?)." >&2; exit 1; }
-  [[ "$first_key" == "None" ]] || { echo "ABORT: s3://$BUCKET/$SHARED_PREFIX/ is not empty ($first_key) and $WORK has no state for it. Use a new SHARED_PREFIX or the WORK dir of the run that created it." >&2; exit 1; }
   echo "$BASE_EPOCH" > "$WORK/state/base_epoch"
   echo "$PARAMS" > "$WORK/state/params"
 fi
@@ -156,7 +185,7 @@ json.dump({
   "base_epoch": $BASE_EPOCH, "weeks": $WEEKS, "blocks_per_week": $BLOCKS_PER_WEEK,
   "clusters": "$CLUSTERS".split(),
   "num_namespaces": $NUM_NAMESPACES, "num_workloads": $NUM_WORKLOADS, "num_pods": $NUM_PODS,
-  "num_extra_metrics": $NUM_EXTRA_METRICS, "num_pod_metrics": $NUM_POD_METRICS, "num_cluster_metrics": $NUM_CLUSTER_METRICS,
+  "num_extra_metrics": $NUM_EXTRA_METRICS, "num_pod_metrics": $NUM_POD_METRICS, "num_node_metrics": $NUM_NODE_METRICS, "num_nodes": $NUM_NODES, "num_cluster_metrics": $NUM_CLUSTER_METRICS,
   "rs_scrape_interval": "${RS_SCRAPE_INTERVAL:-15m}",
   "series_per_block": $SPB, "rs_series_per_block": $RS_SPB, "filler_series_per_block": $FILLER_SPB,
   "blocks_per_cluster": $(( WEEKS * BLOCKS_PER_WEEK )), "expected_blocks": $BLOCKS,
@@ -186,6 +215,7 @@ generate_cw() { # $1=cluster $2=week $3=dir
   rm -rf "$dir"; mkdir -p "$dir"
   ( cd "$dir" && NUM_NAMESPACES=$NUM_NAMESPACES NUM_WORKLOADS=$NUM_WORKLOADS NUM_PODS=$NUM_PODS \
       NUM_EXTRA_METRICS=$NUM_EXTRA_METRICS NUM_POD_METRICS=$NUM_POD_METRICS NUM_CLUSTER_METRICS=$NUM_CLUSTER_METRICS \
+      NUM_NODES=$NUM_NODES NUM_NODE_METRICS=$NUM_NODE_METRICS \
       MIN_GAUGE="${gauges% *}" MAX_GAUGE="${gauges#* }" \
       "$TB" block plan -p "$PROFILE" --labels "cluster=\"$cluster\"" --labels "aggregation=\"1d\"" --max-time "$maxt" \
       | "$TB" block gen --output.dir "$dir" --workers "$WORKERS" ) > "$WORK/log/$cluster-w$w.gen.log" 2>&1
@@ -243,7 +273,21 @@ copy_cw_to_hub() { # $1=cluster $2=ulids file : copy the blocks not yet in HUB_P
   done < "$2"
 }
 publish_body() { # $1=cluster $2=week $3=dir
-  local pfx
+  local pfx u keep
+  if [[ "$SKIP_UPLOAD" == "1" ]]; then
+    # Keep blocks under LOCAL_ROOT/<cluster>/<ULID>/ and do not touch S3.
+    keep="$LOCAL_ROOT/$1"
+    mkdir -p "$keep"
+    while read -r u; do
+      [[ -d "$3/$u" ]] || { echo "local keep: missing block dir $3/$u"; return 1; }
+      rm -rf "$keep/$u"
+      mv "$3/$u" "$keep/$u" || { echo "local keep: failed to move $u"; return 1; }
+    done < "$WORK/state/$1.w$2.ulids"
+    mv "$WORK/state/$1.w$2.ulids" "$WORK/state/$1.w$2.done" || return 1
+    rm -rf "$3"
+    echo "done"
+    return 0
+  fi
   pfx="$(shared_prefix_for "$1")"
   # 1. the whole cluster-week into the shared prefix first ...
   upload_cw_blocks "$3" "$WORK/state/$1.w$2.ulids" "$pfx" || return 1
@@ -256,10 +300,11 @@ publish_body() { # $1=cluster $2=week $3=dir
   echo "done"
 }
 publish_cw() { # $1=cluster $2=week $3=dir $4=attempt label; runs in the background
-  local upload_log="$WORK/log/$1-w$2.upload.log" attempt="${4:-initial}"
-  if { echo "== $attempt upload attempt at $(date -u +%Y-%m-%dT%H:%M:%SZ) =="; publish_body "$1" "$2" "$3"; } >> "$upload_log" 2>&1; then :; else
+  local upload_log="$WORK/log/$1-w$2.upload.log" attempt="${4:-initial}" action="upload"
+  [[ "$SKIP_UPLOAD" == "1" ]] && action="local-keep"
+  if { echo "== $attempt $action attempt at $(date -u +%Y-%m-%dT%H:%M:%SZ) =="; publish_body "$1" "$2" "$3"; } >> "$upload_log" 2>&1; then :; else
     touch "$WORK/state/$1.w$2.failed"; echo "FAILED (see $upload_log)" >> "$upload_log"
-    log "upload of $1 week $2 FAILED ($(tail -1 "$upload_log" | cut -c1-120)); the run continues and will retry at the end" >&2
+    log "$action of $1 week $2 FAILED ($(tail -1 "$upload_log" | cut -c1-120)); the run continues and will retry at the end" >&2
   fi
 }
 
@@ -356,6 +401,18 @@ resume_batch=0
 for f in "$WORK"/state/*.ulids; do
   [[ -e "$f" ]] || continue
   b="$(basename "$f" .ulids)"; cluster="${b%.w*}"; w="${b##*.w}"; dir="$WORK/tmp/$cluster-w$w"
+  if [[ "$SKIP_UPLOAD" == "1" ]]; then
+    if [[ -d "$dir" && "$(complete_blocks_in "$dir")" -eq "$BLOCKS_PER_WEEK" ]]; then
+      log "resume: $cluster week $w generated locally, keeping blocks under $LOCAL_ROOT/$cluster/"
+      publish_cw "$cluster" "$w" "$dir" &
+      resume_batch=$((resume_batch+1))
+      if [[ "$resume_batch" -ge "$MAX_INFLIGHT" ]]; then wait; resume_batch=0; fi
+    else
+      log "resume: $cluster week $w incomplete locally, regenerating"
+      rm -f "$f"; rm -rf "$dir"
+    fi
+    continue
+  fi
   pfx="$(shared_prefix_for "$cluster")"
   present=0
   while read -r u; do s3_has_meta "$pfx" "$u" && present=$((present+1)); done < "$f"
@@ -396,11 +453,17 @@ for cluster in $CLUSTERS; do
       wait; exit 1
     fi
     publish_cw "$cluster" "$w" "$dir" &
-    log "[$i/$TOTAL_CW] $cluster week $w generated in $(( $(date +%s)-t0 ))s; uploading (in flight: $(inflight)); done so far: $(count_state "done")"
+    if [[ "$SKIP_UPLOAD" == "1" ]]; then
+      log "[$i/$TOTAL_CW] $cluster week $w generated in $(( $(date +%s)-t0 ))s; keeping local (in flight: $(inflight)); done so far: $(count_state "done")"
+    else
+      log "[$i/$TOTAL_CW] $cluster week $w generated in $(( $(date +%s)-t0 ))s; uploading (in flight: $(inflight)); done so far: $(count_state "done")"
+    fi
   done
 done
 wait
-retry_failed_uploads
+if [[ "$SKIP_UPLOAD" != "1" ]]; then
+  retry_failed_uploads
+fi
 
 # ---- finish ------------------------------------------------------------------
 FAILED=$(count_state "failed")
@@ -408,8 +471,14 @@ DONE=$(count_state "done")
 if [[ "$FAILED" -gt 0 || "$DONE" -ne "$TOTAL_CW" ]]; then
   echo "== INCOMPLETE: $DONE/$TOTAL_CW cluster-weeks done, $FAILED failed. Re-run the same command to resume. ==" >&2; exit 1
 fi
-REMOTE=$(aws_ s3 ls "s3://$BUCKET/$SHARED_PREFIX/" --recursive | awk '{print $4}' | grep -cE '/[0-9A-Z]{26}/meta\.json$' || true)
-[[ "$REMOTE" -eq "$BLOCKS" ]] || { echo "ABORT: S3 has $REMOTE complete blocks under $SHARED_PREFIX, expected $BLOCKS." >&2; exit 1; }
+if [[ "$SKIP_UPLOAD" == "1" ]]; then
+  # Layout is LOCAL_ROOT/<cluster>/<ULID>/meta.json (depth 3 under LOCAL_ROOT).
+  LOCAL=$(find "$LOCAL_ROOT" -mindepth 3 -maxdepth 3 -type f -name meta.json 2>/dev/null | wc -l | tr -d ' ')
+  [[ "$LOCAL" -eq "$BLOCKS" ]] || { echo "ABORT: local output has $LOCAL complete blocks under $LOCAL_ROOT, expected $BLOCKS." >&2; exit 1; }
+else
+  REMOTE=$(aws_ s3 ls "s3://$BUCKET/$SHARED_PREFIX/" --recursive | awk '{print $4}' | grep -cE '/[0-9A-Z]{26}/meta\.json$' || true)
+  [[ "$REMOTE" -eq "$BLOCKS" ]] || { echo "ABORT: S3 has $REMOTE complete blocks under $SHARED_PREFIX, expected $BLOCKS." >&2; exit 1; }
+fi
 # the exact block list (from the .done files) goes into the manifest for consumers
 python3 - "$WORK/manifest.json" "$WORK/state" <<'PY'
 import json, sys, glob, os
@@ -419,7 +488,15 @@ for f in sorted(glob.glob(os.path.join(sys.argv[2], "*.done"))):
 m["block_ulids"] = ulids; m["generated_at"] = int(__import__("time").time())
 json.dump(m, open(sys.argv[1], "w"), indent=2)
 PY
-s3cp "$WORK/manifest.json" "s3://$BUCKET/$SHARED_PREFIX/manifest.json"
+if [[ "$SKIP_UPLOAD" == "1" ]]; then
+  cp "$WORK/manifest.json" "$LOCAL_ROOT/manifest.json"
+else
+  s3cp "$WORK/manifest.json" "s3://$BUCKET/$SHARED_PREFIX/manifest.json"
+fi
 cp "$WORK/manifest.json" "${MANIFEST:-./gen-180day.manifest.json}"
-echo "== done in $(( ($(date +%s)-START)/60 )) min: $BLOCKS blocks in s3://$BUCKET/$SHARED_PREFIX/ (manifest.json written last)${HUB_PREFIX:+; copied to s3://$BUCKET/$HUB_PREFIX/} =="
+if [[ "$SKIP_UPLOAD" == "1" ]]; then
+  echo "== done in $(( ($(date +%s)-START)/60 )) min: $BLOCKS blocks kept under $LOCAL_ROOT/ (no S3 upload) =="
+else
+  echo "== done in $(( ($(date +%s)-START)/60 )) min: $BLOCKS blocks in s3://$BUCKET/$SHARED_PREFIX/ (manifest.json written last)${HUB_PREFIX:+; copied to s3://$BUCKET/$HUB_PREFIX/} =="
+fi
 echo "   manifest also saved to ${MANIFEST:-./gen-180day.manifest.json} for the validators"

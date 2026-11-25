@@ -3,6 +3,7 @@ package blockgen
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"math/rand" // Import the rand package
 	"os"
 	"sort"
@@ -792,6 +793,40 @@ var rsMeasures = []string{
 	"memory_request", "memory_usage", "memory_recommendation", "memory_limit",
 }
 
+// podName returns the name of pod pi of workload wl in namespace ns of the given
+// cluster, shaped like a Deployment pod: workload, a 10-hex template hash, then
+// the ordinal. The hash comes from cluster/ns/wl, so names do not repeat across
+// namespaces or clusters, and it is deterministic across blocks.
+func podName(cluster, ns, wl string, pi int) string {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(cluster + "/" + ns + "/" + wl))
+	return fmt.Sprintf("%s-%010x-%d", wl, h.Sum64()>>24, pi)
+}
+
+// leveledSeriesPerBlock returns how many series rightSizingLeveled emits per
+// block for the default profiles and no VMs or nodes, and whether that fits the cap.
+func leveledSeriesPerBlock(numNamespaces, numWorkloads, numPods, numExtra, numPodMetrics, numClusterMetrics int) (int, bool) {
+	nsWl, ok1 := boundedMul(maxSeriesPerBlock, numNamespaces, numWorkloads)
+	pods, ok2 := boundedMul(maxSeriesPerBlock, nsWl, numPods)
+	podFiller, ok3 := boundedMul(maxSeriesPerBlock, numPodMetrics, pods)
+	nsFiller, ok4 := boundedMul(maxSeriesPerBlock, numExtra, numNamespaces)
+	if !ok1 || !ok2 || !ok3 || !ok4 || numNamespaces > maxSeriesPerBlock || numClusterMetrics > maxSeriesPerBlock {
+		return -1, false
+	}
+	perMeasure := 1 + numNamespaces + nsWl + pods
+	namespaceHard := 2 * numNamespaces
+	n := len(rsProfiles)*(len(rsMeasures)*perMeasure+namespaceHard+pods) + nsFiller + podFiller + numClusterMetrics
+	return n, n <= maxSeriesPerBlock
+}
+
+// boundedMul returns a*b for non-negative a and b, or false when the product exceeds limit.
+func boundedMul(limit, a, b int) (int, bool) {
+	if a != 0 && b > limit/a {
+		return 0, false
+	}
+	return a * b, true
+}
+
 // rightSizingLeveled generates ACM right-sizing gauges across four aggregation
 // levels — cluster, namespace, workload and pod — each carrying the per-level
 // breakdown labels the acm_rs recording rules / dashboards expect:
@@ -820,8 +855,9 @@ var rsMeasures = []string{
 //	workload:  NUM_NAMESPACES * NUM_WORKLOADS
 //	pod:       NUM_NAMESPACES * NUM_WORKLOADS * NUM_PODS
 //
-// An optional NUM_EXTRA_METRICS filler load (off by default for this profile) can
-// be layered on for cardinality/load testing.
+// Optional filler carries no right-sizing profile. NUM_EXTRA_METRICS is one series
+// per namespace, NUM_POD_METRICS one series per pod, NUM_NODE_METRICS one series
+// per node across NUM_NODES nodes, and NUM_CLUSTER_METRICS one series per cluster.
 func rightSizingLeveled(ranges []time.Duration) PlanFn {
 	return func(ctx context.Context, maxTime model.TimeOrDurationValue, extLset labels.Labels, blockEncoder func(BlockSpec) error) error {
 
@@ -871,6 +907,14 @@ func rightSizingLeveled(ranges []time.Duration) PlanFn {
 		if err != nil {
 			return err
 		}
+		numNodes, err := getEnvInt("NUM_NODES", 0)
+		if err != nil {
+			return err
+		}
+		numNodeMetrics, err := getEnvInt("NUM_NODE_METRICS", 0)
+		if err != nil {
+			return err
+		}
 
 		// RS_SCRAPE_INTERVAL controls the sample interval of acm_rs:* series.
 		// The ACM right-sizing recording rules evaluate once per day, so 24h is
@@ -912,11 +956,12 @@ func rightSizingLeveled(ranges []time.Duration) PlanFn {
 		// acm_rs series are emitted once per profile; filler is not.
 		// The +podInfoSeries accounts for the acm_rs:pod:info metadata metric.
 		podFillerSeries := numPodMetrics * numNamespaces * numWorkloads * numPods
-		projected := len(selectedRSProfiles())*(len(rsMeasures)*perMeasure+namespaceHard+podInfoSeries) + numExtra*numNamespaces + podFillerSeries + numClusterMetrics + vmProjected
-		fmt.Fprintf(os.Stderr, "rightSizingLeveled: %d namespaces x %d workloads x %d pods x %d VMs x %d profiles (+%d ns filler, +%d pod filler, +%d cluster filler, +info) = %d series/block, acm_rs sample interval %s\n",
-			numNamespaces, numWorkloads, numPods, numVMs, len(selectedRSProfiles()), numExtra, numPodMetrics, numClusterMetrics, projected, rsScrapeInterval)
+		nodeFillerSeries := numNodeMetrics * numNodes
+		projected := len(selectedRSProfiles())*(len(rsMeasures)*perMeasure+namespaceHard+podInfoSeries) + numExtra*numNamespaces + podFillerSeries + nodeFillerSeries + numClusterMetrics + vmProjected
+		fmt.Fprintf(os.Stderr, "rightSizingLeveled: %d namespaces x %d workloads x %d pods x %d nodes x %d VMs x %d profiles (+%d ns filler, +%d pod filler, +%d node filler, +%d cluster filler, +info) = %d series/block, acm_rs sample interval %s\n",
+			numNamespaces, numWorkloads, numPods, numNodes, numVMs, len(selectedRSProfiles()), numExtra, numPodMetrics, numNodeMetrics, numClusterMetrics, projected, rsScrapeInterval)
 		if projected > maxSeriesPerBlock {
-			return fmt.Errorf("projected %d series/block exceeds cap %d: lower NUM_NAMESPACES/NUM_WORKLOADS/NUM_PODS/NUM_VMS/NUM_EXTRA_METRICS/NUM_POD_METRICS/NUM_CLUSTER_METRICS", projected, maxSeriesPerBlock)
+			return fmt.Errorf("projected %d series/block exceeds cap %d: lower NUM_NAMESPACES/NUM_WORKLOADS/NUM_PODS/NUM_VMS/NUM_NODES/NUM_EXTRA_METRICS/NUM_POD_METRICS/NUM_NODE_METRICS/NUM_CLUSTER_METRICS", projected, maxSeriesPerBlock)
 		}
 
 		randomJitter := rand.Intn(10) + 1
@@ -933,6 +978,8 @@ func rightSizingLeveled(ranges []time.Duration) PlanFn {
 				ChangeInterval: 10 * time.Minute,
 			},
 		}
+		// Metrics-collector series are scraped every 5m. They do not follow
+		// RS_SCRAPE_INTERVAL, which only applies to the acm_rs recording rules.
 		extraSpec := coreSpec
 		extraSpec.Characteristics.ScrapeInterval = 5 * time.Minute
 
@@ -1070,6 +1117,18 @@ func rightSizingLeveled(ranges []time.Duration) PlanFn {
 							}, extraSpec)
 						}
 					}
+				}
+			}
+
+			// Optional per-node filler (NUM_NODE_METRICS), one series per node per
+			// metric. Real clusters send node CPU, memory, filesystem, and
+			// kube_node_* series at about 300 series per node.
+			for e := 1; e <= numNodeMetrics; e++ {
+				name := fmt.Sprintf("extra_node_metric_%d", e)
+				for i := 0; i < numNodes; i++ {
+					add(name, labels.Labels{
+						{Name: "node", Value: fmt.Sprintf("node-%d", i)},
+					}, extraSpec)
 				}
 			}
 
